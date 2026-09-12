@@ -153,6 +153,7 @@ class BrowserSessionManager:
         if profile_id in self.active_sessions:
             return self.active_sessions[profile_id]
 
+        initial_urls = launch_options.pop("initial_urls", [])
         try:
             camoufox = AsyncCamoufox(**launch_options)
             browser = await camoufox.start()
@@ -169,6 +170,16 @@ class BrowserSessionManager:
         # Fallback: poll the driver pid, only if we could resolve one.
         if process_id:
             session.monitor_task = asyncio.create_task(self._monitor(profile_id, process_id))
+
+        pages = list(getattr(browser, "pages", []))
+        for index, url in enumerate(initial_urls if isinstance(initial_urls, list) else []):
+            if not isinstance(url, str) or not url.strip():
+                continue
+            page = pages[index] if index < len(pages) else await browser.new_page()
+            try:
+                await page.goto(url, wait_until="commit", timeout=15_000)
+            except Exception as exc:  # noqa: BLE001 - navigation failure must not leak a browser session
+                logger.warning(f"Initial URL failed for profile {profile_id}: {url!r}: {exc}")
 
         logger.info(f"Browser launched for profile {profile_id} (pid={process_id})")
         return session

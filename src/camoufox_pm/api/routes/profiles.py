@@ -304,6 +304,7 @@ async def launch_profile(profile_id: str, request: ProfileLaunchRequest):
             profile_id,
             headless=request.headless,
             window_size=request.window_size,
+            initial_urls=request.initial_urls,
             **request.additional_options or {},
         )
 

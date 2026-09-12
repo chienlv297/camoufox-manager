@@ -296,7 +296,7 @@ Nothing writes it but a check that was asked for; there is no polling.
 ## Running browsers
 
 ```http
-POST /api/v1/profiles/{id}/launch    {"headless": false, "window_size": "1280x720"}
+POST /api/v1/profiles/{id}/launch    {"headless": false, "window_size": "1280x720", "initial_urls": ["https://example.com/"]}
 POST /api/v1/profiles/{id}/close
 GET  /api/v1/browsers/active
 POST /api/v1/browsers/close-all
@@ -305,6 +305,10 @@ POST /api/v1/browsers/close-all
 Launch responds with `status` (`launched`, or `already_running` if the profile's
 browser is already up), a `message` and the `process_id`. Closing a browser that
 is not running is a no-op reported as `status: "not_running"`, not an error.
+
+`initial_urls` is optional. After the context is launched, each URL is navigated
+in order into an existing page (or a new page when needed), so callers do not
+need to rely on Firefox command-line URL arguments.
 
 The first launch of a profile resolves its fingerprint and stores it; every
 launch after replays it. Closing the browser window yourself is detected and the

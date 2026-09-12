@@ -23,8 +23,14 @@ class FakeBrowser:
 
     def __init__(self, pid: int | None = None):
         self.handlers: dict[str, list] = {}
+        self.pages: list[FakePage] = []
         if pid is not None:
             self._browser_process = type("Proc", (), {"pid": pid})()
+
+    async def new_page(self):
+        page = FakePage()
+        self.pages.append(page)
+        return page
 
     def on(self, event: str, handler) -> None:
         self.handlers.setdefault(event, []).append(handler)
@@ -54,6 +60,14 @@ class FakeCamoufox:
         self.exits += 1
         if self.exit_error is not None:
             raise self.exit_error
+
+
+class FakePage:
+    def __init__(self):
+        self.urls: list[str] = []
+
+    async def goto(self, url: str, **_kwargs):
+        self.urls.append(url)
 
 
 @pytest.fixture
@@ -187,6 +201,18 @@ async def test_no_watchdog_is_started_when_no_process_id_could_be_resolved(insta
 
     assert session.process_id is None
     assert session.monitor_task is None
+
+
+@pytest.mark.asyncio
+async def test_initial_urls_navigate_the_launched_context_page(installed):
+    browser = FakeBrowser()
+    installed(FakeCamoufox(browser=browser))
+    mgr = BrowserSessionManager()
+
+    await mgr.launch("p1", {"initial_urls": ["https://www.vinted.com/"]})
+
+    assert len(browser.pages) == 1
+    assert browser.pages[0].urls == ["https://www.vinted.com/"]
 
 
 # -- The user closes the window ------------------------------------------------

@@ -226,6 +226,11 @@ class ProfileLaunchRequest(BaseModel):
 
     headless: bool = Field(False, description="Launch in headless mode")
     window_size: str | None = Field(None, description="Window size (1920x1080)")
+    initial_urls: list[str] = Field(
+        default_factory=list,
+        max_length=10,
+        description="URLs to open in the browser context after launch",
+    )
     additional_options: dict[str, Any] | None = Field(
         None, description="Additional Camoufox options"
     )
@@ -235,6 +240,7 @@ class ProfileLaunchRequest(BaseModel):
             "example": {
                 "headless": False,
                 "window_size": "1920x1080",
+                "initial_urls": ["https://example.com/"],
                 "additional_options": {"geoip": True, "humanize": True},
             }
         }
