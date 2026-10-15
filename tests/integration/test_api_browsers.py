@@ -89,6 +89,46 @@ async def test_launching_an_unknown_profile_is_a_404(client):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "expected_urls"),
+    [
+        (
+            {
+                "initial_urls": ["https://top-level.example/"],
+                "additional_options": {
+                    "initial_urls": ["https://legacy.example/"],
+                    "humanize": True,
+                },
+            },
+            ["https://top-level.example/"],
+        ),
+        (
+            {"additional_options": {"initial_urls": ["https://legacy.example/"]}},
+            ["https://legacy.example/"],
+        ),
+    ],
+)
+async def test_launch_accepts_initial_urls_in_additional_options(
+    client, monkeypatch, payload, expected_urls
+):
+    manager = get_profile_manager()
+    captured = {}
+
+    async def fake_launch(profile_id, **kwargs):
+        captured.update(kwargs)
+        return {"status": "launched", "profile_id": profile_id}
+
+    monkeypatch.setattr(manager, "launch_browser", fake_launch)
+
+    response = await client.post("/api/profiles/p1/launch", json=payload)
+
+    assert response.status_code == 200
+    assert captured["initial_urls"] == expected_urls
+    if "humanize" in payload.get("additional_options", {}):
+        assert captured["humanize"] is True
+
+
+@pytest.mark.asyncio
 async def test_a_clone_is_created_as_a_new_profile(client):
     created = (await client.post("/api/profiles", json={"name": "source"})).json()
 

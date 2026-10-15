@@ -298,14 +298,17 @@ async def launch_profile(profile_id: str, request: ProfileLaunchRequest):
     """Launch a browser with a profile."""
     try:
         profile_manager = get_profile_manager()
+        additional_options = dict(request.additional_options or {})
+        additional_initial_urls = additional_options.pop("initial_urls", None)
+        initial_urls = request.initial_urls or additional_initial_urls or []
 
         # Launch the browser
         browser_session = await profile_manager.launch_browser(
             profile_id,
             headless=request.headless,
             window_size=request.window_size,
-            initial_urls=request.initial_urls,
-            **request.additional_options or {},
+            initial_urls=initial_urls,
+            **additional_options,
         )
 
         logger.info(f"Launched browser for profile: {profile_id}")
