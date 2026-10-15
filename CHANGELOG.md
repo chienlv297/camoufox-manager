@@ -6,7 +6,156 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet.
+## [0.6.0-rc.5] - 2026-10-14
+
+Unsigned desktop testing preview with experimental, explicitly enabled synchronization.
+
+### Added
+- Opt-in encrypted profile synchronization between one owner's trusted computers
+  (#82): protected device keys, verified recovery setup, fingerprint-confirmed
+  pairing, revocation and an independent self-hosted HTTPS relay.
+- Durable one-device checkout, close-triggered handoff, explicit retry, signed
+  history validation, journalled activation and lost-device recovery. Conflicts
+  preserve a separate local copy; updater rollback cannot restore stale ownership.
+- Owner workflows for sharing newly created profiles with already paired devices,
+  plus encrypted offline bundles and fresh local historical-copy recovery.
+- Byte-offset upload resume of identical saved ciphertext, signed recoverable
+  Trash and restore, and owner-approved historical cleanup with a seven-day
+  cancellation window. Current heads, signed history and local backups remain.
+- Bounded expiry of unfinished uploads, crash-recoverable cleanup fences and safe
+  client retry with a fresh encryption stream while retaining the original bytes.
+- Native crypto/key-store validation and real browser roundtrip tests for cookies,
+  localStorage, fingerprint and an explicitly selected stable canvas mode.
+
+### Security and compatibility
+- Synchronization is **experimental and off until explicitly configured**.
+  Included in rc.5 desktop installers; rc.4 assets do not contain this feature.
+  Require the same supported OS, architecture and Camoufox build; assigned local
+  extensions block activation. Local roles and schedules are not replicated.
+- Internal security review findings are fixed and covered by regressions. An
+  external cryptographic audit and the remaining production gates in #90 are
+  still required before a generally available release. See the
+  [support matrix](docs/sync-support-matrix.md) and [setup guide](docs/sync-guide.md).
+- Committed relay history is retained unless the owner signs an explicit delayed
+  ciphertext cleanup decision; upload expiry removes only uncommitted uploads.
+  Revocation cannot erase previously downloaded sessions or stop an offline browser.
+
+## [0.6.0-rc.4] - 2026-10-13
+
+Unsigned desktop preview with profile access controls and integrated recovery.
+
+### Added
+- Add administrator/operator/viewer roles, explicit profile and export grants,
+  user administration and a bounded activity log (#77). Existing users retain
+  administrator access; the final administrator cannot be removed or demoted.
+- Enforce grants across collections, bulk actions, downloads and scheduled work;
+  redact credentials from nonadmin metadata and recheck authority during exports.
+- Bind scheduled authority to the original account ID and stop revoked work;
+  record interrupted downloads instead of successful exports.
+- Integrate verified manager/browser downloads with complete checkpoints, offline
+  application replacement, numbered migrations and fresh-process browser validation (#63).
+- Offer timestamp-confirmed binary/data rollback and a standalone recovery window
+  that remains available before opening the database, including interrupted swaps.
+- Bind authenticated archives and retained installations to complete file inventories;
+  refuse cancellation after browser-cache changes and preserve retryable journals.
+
+Automatic installation remains unavailable in unsigned public previews. Production
+TUF provisioning, platform certificates and real signed upgrade trials are still required.
+
+## [0.6.0-rc.3] - 2026-10-13
+
+Unsigned desktop preview with offline recovery; automatic installation remains disabled.
+
+### Fixed
+- Bundle the compatible OpenSSL pair required by cryptography on Intel macOS (#76).
+- Dispatch packaged recovery before desktop bootstrap and report command errors
+  without a modal window; verify the frozen entry point in every desktop build.
+- Omit only recognized transient Firefox profile lock markers from offline copies.
+
+### Added
+- Explicit preview-release discovery and update-recovery status in Settings.
+- Offline complete data/browser checkpoints, resumable restoration and a
+  cross-process maintenance gate with private Windows ACL/POSIX storage.
+- TUF target verification, native publisher verification and journalled offline
+  replacement primitives. Automatic app replacement remains disabled pending
+  production signing and real package-to-package acceptance (#63).
+
+## [0.6.0-rc.2] - 2026-10-13
+
+Desktop preview with stage-two workflows. Installers remain unsigned; see the
+release notes for signing and clean-system acceptance limitations.
+
+### Added
+- Standard JSON/Netscape cookie import and export with validation, merge/replace
+  choices and a recovery snapshot before replacement.
+- Reusable profile templates that preserve settings and extension selections
+  while creating independent browser identities without copied sessions.
+- A local Firefox extension library with permission summaries, validated XPI
+  uploads and portable per-profile snapshots using Camoufox's add-on support.
+- Profile tags, bulk tag changes and persistent saved search/filter/order views.
+- A reusable proxy library with named entries, encrypted write-only passwords,
+  on-demand health checks and bulk URL-list import with safe line diagnostics.
+- Bulk proxy assignment to closed profiles with concurrency checks and explicit
+  partial results. Profiles receive independent copies, so library edits and
+  deletion do not silently change existing browser identities.
+- Authenticated SOCKS5 browsing through a session-owned loopback relay, with
+  upstream DNS, memory-only credentials and cleanup on browser exit. The manager
+  resolves GeoIP through the original proxy before launch without forking Camoufox.
+
+### Changed
+- Clarified native canvas behavior: disabling randomization does not guarantee
+  identical pixels after host-renderer, font or browser changes. Cold Windows
+  variation is tracked separately with a native Firefox control.
+- Camoufox 0.5.8 with its paired Firefox 156 beta.36 browser and Playwright 1.62.
+  Setup now prepares the verified fpgen model; desktop builds carry the model.
+  Browser readiness checks reject unsupported protocol interfaces before launch.
+- Real-browser compatibility checks on Linux, Windows and macOS, including the
+  combined stage-two workflow and offline synthetic test sites.
+- Documented coordinated manager/browser updates, complete installation
+  checkpoints and safe rollback requirements in the update design.
+
+### Fixed
+- Verify imported extension file contents before trusting a library identity or
+  reusing an existing snapshot, including its displayed permissions.
+- Preserve native zero screen origins in new and existing fingerprints instead
+  of allowing omitted coordinates to change between launches.
+- Preserve selected preset CPU identity and reconstruct all Windows fingerprint
+  configuration chunks instead of silently losing the pin.
+- Close cookie-store handles before atomic replacement on Windows, and omit
+  Firefox's root lock artifacts from portable archives without following links.
+- Preserve verified fingerprint-model resources and Playwright compatibility
+  metadata in desktop installers, including read-only installations.
+
+## [0.6.0-rc.1] - 2026-10-07
+
+Desktop preview. Installers are unsigned; clean Windows/Linux installation and
+macOS signing/notarization remain release acceptance work.
+
+### Added
+- Desktop installers on release tags: macOS Intel/Apple Silicon DMGs, Windows
+  setup executable, Linux Debian package and portable archive. Signing remains
+  conditional on maintainer certificates; unsigned builds are labelled as such.
+- A native desktop entry point, stable OS data directory, single-instance lock,
+  conflict-free local port and a persisted encryption key for fresh desktop data.
+- Browser setup from the interface, download progress and retry; readiness checks
+  inspect actual browser files, and launches report missing setup before fetching.
+- Short English/Russian getting-started guides and a simpler first-profile form.
+- Trash with restoration and explicit permanent deletion. Automatic profile
+  backups, manual snapshots and additive restoration from Settings. Closed
+  profiles only; backups contain credentials and do not cover app users/settings.
+- Update checks with a complete profile backup required before opening the
+  official release download page. Installing the update remains an OS action.
+- Desktop browser chrome using upstream `disableTheming` / `showcursor` options;
+  profile settings can retain the minimal Camoufox theme without an engine fork.
+
+### Changed
+- Deleting a profile moves it to Trash and pauses its schedules. Permanent
+  deletion is a separate recovery endpoint; profile data is no longer removed
+  by ordinary DELETE requests.
+- Export, backup and clone operations hold cross-instance leases while reading
+  profile data. Archive failures preserve earlier recovery copies.
+- IBM Plex fonts are bundled locally with their licenses, so frontend builds no
+  longer depend on Google Fonts or its build-time URL transformation.
 
 ## [0.5.0] - 2026-09-15
 
@@ -635,7 +784,10 @@ First public release after a comprehensive revamp.
   Camoufox owns fingerprint generation for consistency.
 - Committed profile data, leaked proxy credentials, and duplicate/backup files.
 
-[Unreleased]: https://github.com/polyackiy/camoufox-profile-manager/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/polyackiy/camoufox-profile-manager/compare/v0.6.0-rc.3...HEAD
+[0.6.0-rc.3]: https://github.com/polyackiy/camoufox-profile-manager/compare/v0.6.0-rc.2...v0.6.0-rc.3
+[0.6.0-rc.2]: https://github.com/polyackiy/camoufox-profile-manager/compare/v0.6.0-rc.1...v0.6.0-rc.2
+[0.6.0-rc.1]: https://github.com/polyackiy/camoufox-profile-manager/compare/v0.5.0...v0.6.0-rc.1
 [0.5.0]: https://github.com/polyackiy/camoufox-profile-manager/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/polyackiy/camoufox-profile-manager/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/polyackiy/camoufox-profile-manager/compare/v0.3.0...v0.4.0

@@ -92,12 +92,13 @@ async def test_an_unsaved_proxy_can_be_checked(client, exit_in_tokyo):
 
 
 @pytest.mark.asyncio
-async def test_socks_credentials_are_reported_as_a_launch_failure(client, exit_in_tokyo):
+@pytest.mark.parametrize("kind,levels", [("socks4", ["error"]), ("socks5", [])])
+async def test_socks_credentials_follow_supported_protocol(client, exit_in_tokyo, kind, levels):
     checked = await client.post(
         "/api/proxy/check",
         json={
             "proxy_config": {
-                "type": "socks5",
+                "type": kind,
                 "server": "h:1080",
                 "username": "u",
                 "password": "p",
@@ -106,7 +107,7 @@ async def test_socks_credentials_are_reported_as_a_launch_failure(client, exit_i
         },
     )
 
-    assert [f["level"] for f in checked.json()["findings"]] == ["error"]
+    assert [f["level"] for f in checked.json()["findings"]] == levels
 
 
 @pytest.mark.asyncio
@@ -266,14 +267,19 @@ async def test_a_clone_starts_unchecked(client, exit_in_tokyo):
 
 @pytest.fixture
 def slow_exit(monkeypatch):
-    """A check that takes long enough for the user to edit the profile under it."""
+    """Hold the network answer until the concurrent edit has completed."""
+    started, release = asyncio.Event(), asyncio.Event()
 
     async def resolve(proxy, timeout=proxy_check.DEFAULT_TIMEOUT):
-        await asyncio.sleep(0.3)
+        started.set()
+        await release.wait()
         return TOKYO.ip, 42
 
     monkeypatch.setattr(proxy_check, "resolve_exit_ip", resolve)
     monkeypatch.setattr(proxy_check, "locate", lambda ip: TOKYO)
+
+    yield started, release
+    release.set()
 
 
 @pytest.mark.asyncio
@@ -291,9 +297,16 @@ async def test_an_edit_during_a_check_is_not_reverted(client, slow_exit):
     profile_id = created.json()["id"]
 
     checking = asyncio.create_task(client.post(f"/api/profiles/{profile_id}/check-proxy"))
-    await asyncio.sleep(0.1)
-    await client.put(f"/api/profiles/{profile_id}", json={"name": "renamed", "notes": "typed"})
-    await checking
+    started, release = slow_exit
+    try:
+        await asyncio.wait_for(started.wait(), timeout=10)
+        edited = await client.put(
+            f"/api/profiles/{profile_id}", json={"name": "renamed", "notes": "typed"}
+        )
+        assert edited.status_code == 200, edited.text
+    finally:
+        release.set()
+        await checking
 
     profile = (await client.get(f"/api/profiles/{profile_id}")).json()
     assert profile["name"] == "renamed", "the rename was reverted by the check"
@@ -311,12 +324,17 @@ async def test_a_proxy_changed_during_a_check_keeps_no_answer(client, slow_exit)
     profile_id = created.json()["id"]
 
     checking = asyncio.create_task(client.post(f"/api/profiles/{profile_id}/check-proxy"))
-    await asyncio.sleep(0.1)
-    await client.put(
-        f"/api/profiles/{profile_id}",
-        json={"proxy_config": {"type": "http", "server": "new.example.com:8080"}},
-    )
-    answer = await checking
+    started, release = slow_exit
+    try:
+        await asyncio.wait_for(started.wait(), timeout=10)
+        edited = await client.put(
+            f"/api/profiles/{profile_id}",
+            json={"proxy_config": {"type": "http", "server": "new.example.com:8080"}},
+        )
+        assert edited.status_code == 200, edited.text
+    finally:
+        release.set()
+        answer = await checking
 
     profile = (await client.get(f"/api/profiles/{profile_id}")).json()
     assert profile["proxy_config"]["server"] == "new.example.com:8080", "the edit was reverted"

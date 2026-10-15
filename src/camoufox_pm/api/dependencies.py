@@ -4,6 +4,8 @@ import hmac
 
 from fastapi import Header, HTTPException, Request
 
+from camoufox_pm.api.access import request_principal, request_session_hash
+from camoufox_pm.api.principal import Principal
 from camoufox_pm.config import get_settings
 from camoufox_pm.core import auth
 from camoufox_pm.core.database import StorageManager
@@ -71,8 +73,10 @@ async def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
-async def require_auth(request: Request, x_api_key: str | None = Header(default=None)) -> None:
-    """The guard on every API route: a login session or the API key.
+async def require_auth(request: Request, x_api_key: str | None = Header(default=None)) -> Principal:
+    """Authenticate a request and expose its credential-free principal.
+
+    The guard on every API route accepts a login session or the API key.
 
     Three configurations, all decided per request so a user created by the CLI
     while the server runs takes effect immediately:
@@ -83,15 +87,39 @@ async def require_auth(request: Request, x_api_key: str | None = Header(default=
     - any user account exists — everything else needs a valid session cookie.
     """
     if _api_key_matches(x_api_key):
-        return
+        principal = Principal("legacy_api_key")
+        request.state.principal = principal
+        request_principal.set(principal)
+        return principal
     storage = get_storage_manager()
     if await storage.count_users() == 0:
         if not get_settings().api_key:
-            return
+            principal = Principal("anonymous_local")
+            request.state.principal = principal
+            request_principal.set(principal)
+            return principal
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
     token = request.cookies.get(auth.SESSION_COOKIE)
-    if token and await auth.validate_session(storage, token) is not None:
-        return
+    recovery_control = request.url.path in {
+        f"{prefix}/system/update-recovery{suffix}"
+        for prefix in ("/api", "/api/v1")
+        for suffix in ("", "/cancel", "/apply", "/resume", "/rollback")
+    }
+    if token:
+        username = (
+            await auth.validate_session(storage, token, read_only=True)
+            if recovery_control
+            else await auth.validate_session(storage, token)
+        )
+        if username is not None:
+            user = await storage.get_user_by_username(username)
+            if user is None:
+                raise HTTPException(status_code=401, detail="Authentication required")
+            principal = Principal("session", username=username, role=user["role"])
+            request_session_hash.set(auth.hash_token(token))
+            request.state.principal = principal
+            request_principal.set(principal)
+            return principal
     raise HTTPException(
         status_code=401, detail="Authentication required: log in or send a valid API key"
     )

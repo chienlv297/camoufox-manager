@@ -88,19 +88,20 @@ async def test_cloning_an_unknown_profile_returns_nothing(profile_manager):
 
 
 @pytest.mark.asyncio
-async def test_deleting_a_profile_removes_its_directory(profile_manager):
+async def test_deleting_a_profile_retains_its_directory_in_trash(profile_manager):
     profile = await profile_manager.create_profile(name="gone")
     directory = Path(profile.get_storage_path(str(profile_manager.profiles_dir)))
     (directory / "cookies.sqlite").write_bytes(b"session")
 
     assert await profile_manager.delete_profile(profile.id) is True
-    assert not directory.exists()
+    assert (directory / "cookies.sqlite").read_bytes() == b"session"
     assert await profile_manager.get_profile(profile.id) is None
+    assert [p.id for p in await profile_manager.list_trashed_profiles()] == [profile.id]
 
 
 @pytest.mark.asyncio
 async def test_the_data_can_be_kept_when_the_profile_is_deleted(profile_manager):
-    """The record goes, the directory stays — for a manual backup before a purge."""
+    """Legacy remove_data=False also preserves the recoverable profile."""
     profile = await profile_manager.create_profile(name="gone")
     directory = Path(profile.get_storage_path(str(profile_manager.profiles_dir)))
     (directory / "cookies.sqlite").write_bytes(b"session")
@@ -244,6 +245,26 @@ async def test_a_pinned_machine_is_replayed_on_every_launch(profile_manager, lau
 
     assert launches[0]["config"]["webGl:renderer"] == PINNED["webGl:renderer"]
     assert launches[0]["config"]["screen.width"] == 2560
+
+
+@pytest.mark.asyncio
+async def test_existing_pin_keeps_native_zero_screen_origin(profile_manager, launches):
+    profile = await profile_manager.create_profile(name="p")
+    profile.fingerprint = {
+        **PINNED,
+        "screen.availWidth": 1920,
+        "screen.availHeight": 1040,
+    }
+    await profile_manager.storage.update_profile(profile)
+
+    await profile_manager.launch_browser(profile.id)
+
+    config = launches[0]["config"]
+    assert config["screen.availLeft"] == config["screen.availTop"] == 0
+    stored = await profile_manager.get_profile(profile.id)
+    assert stored.fingerprint["screen.availLeft"] == 0
+    assert stored.fingerprint["screen.availTop"] == 0
+    assert stored.fingerprint["webGl:renderer"] == PINNED["webGl:renderer"]
 
 
 @pytest.mark.asyncio

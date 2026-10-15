@@ -3,11 +3,12 @@
 import re
 import secrets
 import string
+import unicodedata
 from datetime import datetime
 from enum import Enum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 # Characters used for short IDs, excluding visually confusing ones (0, o, 1, l, i).
 _ID_ALPHABET = "".join(c for c in (string.ascii_lowercase + string.digits) if c not in "0o1li")
@@ -98,6 +99,9 @@ class BrowserSettings(BaseModel):
     Camoufox cannot derive on its own are emitted via :meth:`to_camoufox_config`.
     """
 
+    # Browser chrome only; fingerprint and privacy settings remain independent.
+    browser_ui: Literal["desktop", "camoufox"] = "desktop"
+
     # Base settings
     os: str = "windows"  # windows, linux, macos
     screen: str = "1920x1080"
@@ -163,7 +167,9 @@ class BrowserSettings(BaseModel):
         own generator owns user-agent, WebGL, canvas and audio to keep the
         fingerprint internally consistent.
         """
-        config: dict[str, Any] = {}
+        config: dict[str, Any] = {"disableTheming": self.browser_ui == "desktop"}
+        if self.browser_ui == "desktop":
+            config["showcursor"] = False
         if self.geolocation:
             config["geolocation:latitude"] = self.geolocation["lat"]
             config["geolocation:longitude"] = self.geolocation["lon"]
@@ -216,6 +222,29 @@ class ProxyCheckRecord(BaseModel):
     findings: list[ProxyCheckFinding] = Field(default_factory=list)
 
 
+def normalize_tags(values: Any) -> list[str]:
+    """Bounded, case-insensitive labels; tags never affect browser identity."""
+    if not isinstance(values, list) or len(values) > 100:
+        raise ValueError("Tags must be a list with at most 100 inputs")
+    result: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or any(
+            unicodedata.category(char).startswith("C") for char in value
+        ):
+            raise ValueError("Tags must be strings without control characters")
+        tag = " ".join(unicodedata.normalize("NFC", value).casefold().split())
+        if not tag or len(tag) > 32 or "," in tag:
+            raise ValueError("Each tag must contain 1 to 32 characters without commas")
+        if tag not in result:
+            result.append(tag)
+    if len(result) > 20:
+        raise ValueError("A profile can have at most 20 tags")
+    return result
+
+
+ProfileTags = Annotated[list[str], BeforeValidator(normalize_tags)]
+
+
 class Profile(BaseModel):
     """Browser profile."""
 
@@ -224,10 +253,12 @@ class Profile(BaseModel):
     id: str = Field(default_factory=generate_profile_id)
     name: str
     group: str | None = None
+    tags: ProfileTags = Field(default_factory=list)
     status: ProfileStatus = ProfileStatus.ACTIVE
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
     last_used: datetime | None = None
+    deleted_at: datetime | None = None
 
     browser_settings: BrowserSettings = Field(default_factory=BrowserSettings)
     proxy: ProxyConfig | None = None
@@ -284,8 +315,8 @@ class Profile(BaseModel):
             # Firefox's baseline fingerprinting protection randomises canvas image
             # export (toDataURL/toBlob, 2D and WebGL) per site and per session.
             # Turning it off makes the canvas reproducible, which is what a
-            # long-lived profile needs — together with the pinned fonts:spacing_seed,
-            # since text rendering follows that seed rather than the canvas path.
+            # long-lived profile needs, together with the pinned font list.
+            # Camoufox 0.5.8 no longer emits canvas or glyph-spacing noise seeds.
             #
             # The cost is deliberate: the canvas is then identical across sites,
             # exactly as real hardware behaves, so it can be correlated between
@@ -396,6 +427,9 @@ class Schedule(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
     id: str = Field(default_factory=generate_schedule_id)
+    actor_kind: Literal["session", "system", "legacy_api_key", "anonymous_local"] = "system"
+    actor_username: str | None = None
+    actor_user_id: str | None = None
     profile_id: str
     action: ScheduleAction
     kind: ScheduleKind

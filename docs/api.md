@@ -208,6 +208,10 @@ PUT    /api/v1/profiles/{id}
 DELETE /api/v1/profiles/{id}
 ```
 
+`DELETE` now moves the profile to Trash, retains its browser directory and pauses
+its schedules. It is hidden from normal list/get/launch calls. A running or leased
+profile returns `409`. Use the explicit Trash endpoint below to erase it.
+
 `PUT` takes the same shape as create. `browser_settings` is **merged** over what
 is stored, so sending one field does not reset the rest of the fingerprint. The
 older flattened form (`browser_os`, `browser_timezone`, …) still works and is
@@ -302,6 +306,37 @@ call reports itself; `422` for an empty list.
 
 ## Checking a proxy
 
+### Reusable proxy library
+
+The protected `/api/v1/proxies` resource stores named proxy configurations.
+The legacy `/api/proxies` paths are aliases. See the
+[user guide](proxy-library.md) for assignment and recovery semantics.
+
+| Method and path | Request / result |
+| --- | --- |
+| `GET /proxies` | `data.proxies`: public entries |
+| `POST /proxies` | `name`, `type`, `server`, optional `username`, `password`, `country`; returns entry (201) |
+| `PATCH /proxies/{id}` | `row_version` plus changed fields; returns entry |
+| `DELETE /proxies/{id}?row_version=N` | Deletes the entry; assigned profiles retain their copy |
+| `POST /proxies/{id}/check` | Runs a check; returns entry with `last_check` |
+| `POST /proxies/import` | `{ "text": "host:port\\n..." }`; returns `created` entries and `skipped` line/reason pairs |
+| `POST /proxies/{id}/assign` | `{ "proxy_row_version": N, "profiles": [{"id": "...", "row_version": N}] }`; returns `assigned` IDs and `skipped` ID/reason pairs |
+
+All results use the standard `ApiResponse` envelope. Public entries include
+`id`, `name`, `type`, `server`, `username`, `country`, `has_password`,
+`row_version`, `last_check`, `created_at` and `updated_at`. Passwords never appear
+in library responses. Omitting a password during PATCH preserves it; `null`
+clears it. Password writes and credential-dependent operations fail safely when
+the encryption key is unavailable. Stale edits return 409.
+
+Import accepts up to 100 nonempty lines / 64,000 characters, validates the whole
+batch before writes, and skips exact duplicates. Assignment accepts up to 100
+distinct profiles and reports per-profile conflicts instead of overwriting a
+running or concurrently changed profile. It copies credentials into the profile
+under its operation lease; it does not create a reference to the library entry.
+
+### Profile and unsaved checks
+
 ```http
 POST /api/v1/profiles/{id}/check-proxy
 POST /api/v1/proxy/check      {"proxy_config": {...}, "browser_settings": {...}}
@@ -324,6 +359,60 @@ the profile — `checked_at`, `reachable`, `error`, `latency_ms`, `ip`, `country
 itself. It is `null` until the profile is checked, and again whenever its proxy
 changes, because an answer from the previous proxy says nothing about the new one.
 Nothing writes it but a check that was asked for; there is no polling.
+
+## Cookies, templates and extensions
+
+All paths below use the same authentication guard as profiles and have `/api`
+aliases. These operations use the action envelope unless downloading a file.
+See [cookies](cookies.md), [templates](templates.md) and
+[extensions](extensions.md) for formats, browser requirements and limits.
+
+| Method and path (under `/api/v1`) | Purpose |
+| --- | --- |
+| `POST /profiles/{id}/cookies/preview` | Validate `{format, text}` and return counts and safe row diagnostics |
+| `POST /profiles/{id}/cookies/import` | Import `{format, text, mode, row_version, confirm_replace}` into a closed profile |
+| `GET /profiles/{id}/cookies/export?format=json&row_version=N` | Download JSON or Netscape cookies from a closed profile |
+| `GET /templates` / `POST /templates` | List or create reusable settings and extension snapshots |
+| `POST /templates/from-profile` | Save `{profile_id, profile_row_version, name}` as a template |
+| `PATCH /templates/{id}` | Change template fields with `row_version` |
+| `DELETE /templates/{id}?row_version=N` | Remove a template without changing created profiles |
+| `POST /templates/{id}/profiles` | Create an independent profile from `{name, group?, row_version}` |
+| `GET /extensions` / `POST /extensions` | List extensions or upload a multipart `file` containing a local XPI |
+| `DELETE /extensions/{id}?row_version=N` | Remove a library entry while preserving assigned copies |
+| `GET /profiles/{id}/extensions` | Inspect the profile's extension snapshots and permissions |
+| `PUT /profiles/{id}/extensions` | Set `{extension_ids, row_version}` on a closed profile |
+
+Cookie formats are `json` and `netscape`; modes are `merge` and `replace`.
+Replacement requires `confirm_replace: true` and a successful recovery archive.
+Cookie contents never belong in application logs. Exports are sensitive files.
+Templates exclude proxy credentials, stored sessions and the pinned fingerprint.
+Extension assignment stores relative snapshots within profile data, so browser
+launch and archive transfer do not depend on the original library entry.
+
+## Tags and saved views
+
+Profile create/update accepts `tags`; `[]` clears them. Tags are normalized,
+deduplicated labels (at most 20, each at most 32 characters). List filters include
+`search`, `group`, `status`, `tag` and repeated `tags`. Multiple tags must all
+match; filtering happens before pagination. `group=__ungrouped__` selects profiles
+without a group, and search matches names or IDs.
+
+`POST /profiles/tags` accepts `{profiles: [{id, row_version}], add: [], remove: []}`.
+It returns `data.updated` and `data.skipped`; a conflict in one profile does not
+silently overwrite it or discard other successes. Tags are metadata and can be
+edited while a browser runs.
+
+`GET /saved-filters` returns `data.filters`. Create with `POST /saved-filters`
+using `{name, config}`. Config stores `search`, `status`, `group`, `tags`,
+`sort_key` and `sort_direction`. Update with `PATCH /saved-filters/{id}` and
+`row_version`; delete with `DELETE /saved-filters/{id}?row_version=N`.
+These views are shared by authorized users of the instance, not private per-user
+records. See [profile organization](profile-organization.md).
+
+Settings recovery archives contain profile data, including assigned extensions
+and tags. They do not back up the application's template, extension-library or
+saved-view tables; preserving those requires the application database and its
+encryption key as part of an offline installation backup.
 
 ## Running browsers
 
@@ -355,6 +444,70 @@ instance is gone. There is no force-unlock endpoint: releasing another
 instance's lease needs `camoufox-pm unlock` on the host.
 
 ## Moving a profile
+
+### Recovery and first-run setup
+
+```http
+GET    /api/v1/trash/profiles
+POST   /api/v1/trash/profiles/{id}/restore
+DELETE /api/v1/trash/profiles/{id}?confirm=true
+GET    /api/v1/system/backups
+POST   /api/v1/system/backups             {"profile_ids": ["id"], "reason": "manual"}
+POST   /api/v1/system/backups/{id}/restore {"name": "Recovered profile"}
+GET    /api/v1/system/browser
+POST   /api/v1/system/browser/install
+GET    /api/v1/system/updates            ?channel=stable|preview
+POST   /api/v1/system/updates/prepare    ?channel=stable|preview
+GET    /api/v1/system/update-recovery
+POST   /api/v1/system/update-recovery/cancel
+```
+
+These endpoints use the same authentication as the rest of the API and return
+`{success, message, data}`. Trash has no automatic expiry. Restoring it reuses
+the original profile but leaves schedules paused. Permanent deletion requires
+`confirm=true` and only accepts already-trashed, closed profiles.
+
+Backups carry settings, the pinned fingerprint and browser data. Restore creates
+a **new** ID/directory, leaving existing profiles unchanged. Archives contain
+session cookies and decrypted proxy credentials: keep them private. They do not
+include app login users, app settings or schedules. Backup creation returns
+`data.backups` and `data.skipped` (profile ID/reason); live profiles, missing
+directories and unreadable credentials are not reported as successful backups.
+Omit `profile_ids` to back up all profiles, including Trash. The running app
+retries due backups every minute, defaulting to one snapshot per 24 hours and
+seven routine snapshots per profile; `CPM_BACKUP_INTERVAL_HOURS` and
+`CPM_BACKUP_RETENTION` configure this. Two latest before-update checkpoints are
+retained separately.
+
+Browser status is `{installed, version, state, progress, message, error}`, where
+`state` is `idle`, `downloading`, `ready` or `error`, and progress is 0–100 or null.
+GET does not download anything. POST starts an in-process background download
+and repeated POSTs while downloading reuse it. Poll GET to observe completion.
+This delegates versioned installation to Camoufox and verifies a provided asset
+digest. Incomplete first-run resources are reported and can be retried.
+
+Update check queries the project's official GitHub releases, returning
+`{current_version, latest_version, available, release_url, assets, error}`.
+The channel defaults to `stable`; `preview` must be selected explicitly and
+accepts published stable/RC tags, never drafts or downgrade offers. Use the same
+channel for preparation as the check.
+Prepare creates before-update backups and returns
+`{release_url, backup_count, message}` only if every profile was backed up.
+It fails with `409` for incomplete backups or no newer release, and `503` when
+the release check failed. It does not replace the running application: close it
+and install the chosen release with the operating system installer.
+
+Recovery status returns sanitized transaction state, optional manager/browser
+versions and timestamp, `maintenance_active`, `can_cancel`, and
+`automatic_install_available` (currently false). Recovery controls retain normal
+authentication but use read-only session validation during maintenance. Cancelling
+returns 409 after replacement starts or when a helper journal requires recovery.
+Ordinary API requests receive 503 with Retry-After during maintenance. After a
+restart with an interrupted transaction, use the [offline recovery CLI](update-recovery.md);
+the app refuses to open/migrate data before recovery. No HTTP route accepts
+arbitrary package paths, trust roots or restore destinations.
+
+### Manual profile transfer
 
 ```http
 GET  /api/v1/profiles/{id}/export      → application/zip

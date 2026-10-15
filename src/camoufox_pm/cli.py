@@ -20,22 +20,90 @@ import uvicorn
 from camoufox_pm.config import get_settings
 from camoufox_pm.core.database import StorageManager
 from camoufox_pm.core.leases import lease_expired
-from camoufox_pm.paths import is_windows_standalone
+from camoufox_pm.core.maintenance import configured_gate
+
+
+def _admitted_command(function):
+    async def admitted(*args, **kwargs):
+        with configured_gate().operation():
+            return await function(*args, **kwargs)
+
+    return admitted
 
 
 def main() -> None:
+    if sys.argv[1:] == ["--sync-recovery-verify"]:
+        from camoufox_pm.sync.recovery import recovery_worker_main
+
+        raise SystemExit(recovery_worker_main())
+    # These fixed internal commands run before desktop bootstrap and DB startup.
+    if len(sys.argv) >= 2 and sys.argv[1] == "--update-validate":
+        if len(sys.argv) != 3:
+            raise SystemExit("Validation requires exactly one helper receipt")
+        from camoufox_pm.core.update_validation import validate_installed_process
+
+        validate_installed_process(sys.argv[2])
+        return
+    if len(sys.argv) >= 2 and sys.argv[1] == "--update-helper":
+        helper = argparse.ArgumentParser(prog="camoufox-pm --update-helper")
+        helper.add_argument("action", choices=("apply", "resume", "rollback"))
+        helper.add_argument("--confirm-timestamp")
+        helper.add_argument("--wait-pid", type=int)
+        helper.add_argument("--wait-created", type=float)
+        args = helper.parse_args(sys.argv[2:])
+        if args.wait_pid is not None:
+            if args.wait_created is None or args.wait_pid <= 0:
+                helper.error("wait requires a process identity")
+            import psutil
+
+            try:
+                parent = psutil.Process(args.wait_pid)
+                if abs(parent.create_time() - args.wait_created) < 0.01:
+                    parent.wait(timeout=60)
+            except psutil.NoSuchProcess:
+                pass
+            except (psutil.TimeoutExpired, psutil.AccessDenied) as exc:
+                raise SystemExit("The manager did not exit; offline update refused") from exc
+        from camoufox_pm.config import Settings, desktop_data_dir
+        from camoufox_pm.core.update_runtime import execute_request, reopen_desktop
+
+        configured = Settings()
+        if "db_path" not in configured.model_fields_set:
+            os.environ["CPM_DB_PATH"] = str(desktop_data_dir() / "profiles.db")
+        get_settings.cache_clear()
+        if args.action == "rollback" and not args.confirm_timestamp:
+            helper.error("rollback requires --confirm-timestamp")
+        try:
+            if args.action == "rollback":
+                execute_request("rollback", confirmed_timestamp=args.confirm_timestamp)
+            else:
+                execute_request(args.action)
+        except Exception:
+            reopen_desktop()
+            raise
+        reopen_desktop()
+        return
+    if "--desktop" in sys.argv[1:]:
+        from camoufox_pm.config import bootstrap_desktop
+
+        if "update-recovery" in sys.argv[1:]:
+            # Recovery must not generate a key if a restore temporarily renamed
+            # both the database and original key. Resolve desktop defaults only.
+            from camoufox_pm.config import Settings, desktop_data_dir
+
+            configured = Settings()
+            if "db_path" not in configured.model_fields_set:
+                os.environ["CPM_DB_PATH"] = str(desktop_data_dir() / "profiles.db")
+            get_settings.cache_clear()
+        else:
+            bootstrap_desktop()
     settings = get_settings()
     parser = argparse.ArgumentParser(
         prog="camoufox-pm",
         description="Run the Camoufox Profile Manager (API + web UI) on one port.",
     )
     parser.add_argument("--host", default=settings.host, help="Bind address")
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=None,
-        help="Port; packaged desktop mode chooses a free port when omitted",
-    )
+    parser.add_argument("--port", type=int, default=settings.port, help="Port")
     parser.add_argument("--no-browser", action="store_true", help="Do not open a browser")
     parser.add_argument(
         "--desktop",
@@ -97,13 +165,79 @@ def main() -> None:
         help="List the profiles currently leased, and by whom",
     )
 
+    recovery = subcommands.add_parser(
+        "update-recovery",
+        help="Inspect or cancel interrupted update preparation without opening application data",
+    )
+    recovery.add_argument("action", choices=("status", "cancel", "checkpoint", "restore"))
+
+    recovery.add_argument("--checkpoint-id")
+    recovery.add_argument(
+        "--confirm-timestamp",
+        help="Exact UTC checkpoint timestamp; acknowledges loss of later changes",
+    )
+
     args = parser.parse_args()
-    if args.port is None:
-        args.port = (
-            0
-            if args.desktop and is_windows_standalone() and "port" not in settings.model_fields_set
-            else settings.port
-        )
+
+    if args.command == "update-recovery":
+        import json
+
+        from camoufox_pm.core.update_service import UpdateService
+
+        gate = configured_gate()
+        service = UpdateService(gate.path.parent, gate)
+        if args.action == "checkpoint":
+            from camoufox_pm.core.update_recovery import offline_checkpoint
+
+            checkpoint_id = offline_checkpoint()
+            checkpoint_journal = service.root / "checkpoints" / checkpoint_id / "journal.json"
+            timestamp = json.loads(checkpoint_journal.read_text())["created_at"]
+            metadata = json.loads((checkpoint_journal.parent / "key-reference.json").read_text())
+            versions = {
+                key: metadata.get(key)
+                for key in ("manager_version", "wrapper_version", "browser_active")
+            }
+            print(
+                json.dumps(
+                    {"checkpoint_id": checkpoint_id, "created_at": timestamp, **versions}, indent=2
+                )
+            )
+            return
+        if args.action == "restore":
+            from camoufox_pm.core.update_recovery import offline_restore
+
+            if not args.checkpoint_id or not args.confirm_timestamp:
+                parser.error("restore requires --checkpoint-id and --confirm-timestamp")
+            offline_restore(args.checkpoint_id, args.confirm_timestamp)
+            print("Complete data and browser checkpoint restored; newer copies were retained.")
+            return
+        if args.action == "cancel":
+            if service.status()["state"] == "checkpoint_interrupted":
+                service.cancel_abandoned_checkpoint()
+            else:
+                service.cancel_preparation()
+        status = service.status()
+        status["checkpoints"] = []
+        for journal_path in sorted((service.root / "checkpoints").glob("*/journal.json")):
+            try:
+                journal = json.loads(journal_path.read_text())
+                metadata = json.loads((journal_path.parent / "key-reference.json").read_text())
+                versions = {
+                    key: metadata.get(key)
+                    for key in ("manager_version", "wrapper_version", "browser_active")
+                }
+                status["checkpoints"].append(
+                    {
+                        "checkpoint_id": journal_path.parent.name,
+                        "created_at": journal.get("created_at"),
+                        "state": journal.get("state"),
+                        **versions,
+                    }
+                )
+            except (OSError, ValueError):
+                continue
+        print(json.dumps(status, indent=2))
+        return
 
     if args.command == "user":
         asyncio.run(_run_user_command(args))
@@ -138,16 +272,7 @@ def main() -> None:
     # PyInstaller bundle where uvicorn cannot resolve the module by name.
     from camoufox_pm.main import app
 
-    if is_windows_standalone():
-        uvicorn.run(
-            app,
-            host=args.host,
-            port=args.port,
-            log_level="info",
-            log_config=None,
-        )
-    else:
-        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
 def _fail(message: str) -> NoReturn:
@@ -170,6 +295,7 @@ def _read_password(args: argparse.Namespace) -> str:
     return password
 
 
+@_admitted_command
 async def _run_unlock_command(args: argparse.Namespace) -> None:
     """Force-release one profile's lease; shell-only (see the parser)."""
     storage = StorageManager(get_settings().db_path)
@@ -199,6 +325,7 @@ async def _run_unlock_command(args: argparse.Namespace) -> None:
         await storage.close()
 
 
+@_admitted_command
 async def _run_leases_command() -> None:
     """Show who holds what, so `unlock` is a decision and not a guess."""
     storage = StorageManager(get_settings().db_path)
@@ -218,8 +345,10 @@ async def _run_leases_command() -> None:
         await storage.close()
 
 
+@_admitted_command
 async def _run_user_command(args: argparse.Namespace) -> None:
     # Imported here so plain `camoufox-pm` startup does not pay for them.
+    from camoufox_pm.api.principal import Principal
     from camoufox_pm.core import auth
     from camoufox_pm.core.database import StorageManager
 
@@ -230,7 +359,10 @@ async def _run_user_command(args: argparse.Namespace) -> None:
             password = _read_password(args)
             try:
                 await storage.create_user(
-                    auth.new_user_id(), args.username, auth.hash_password(password)
+                    auth.new_user_id(),
+                    args.username,
+                    auth.hash_password(password),
+                    actor=Principal("system"),
                 )
             except ValueError as exc:
                 _fail(str(exc))
@@ -240,11 +372,17 @@ async def _run_user_command(args: argparse.Namespace) -> None:
             )
         elif args.user_command == "passwd":
             password = _read_password(args)
-            if not await storage.update_user_password(args.username, auth.hash_password(password)):
+            if not await storage.update_user_password(
+                args.username, auth.hash_password(password), actor=Principal("system")
+            ):
                 _fail(f"No user named '{args.username}'.")
             print(f"Password updated for '{args.username}'.")
         elif args.user_command == "remove":
-            if not await storage.delete_user(args.username):
+            try:
+                deleted = await storage.delete_user(args.username, actor=Principal("system"))
+            except ValueError as exc:
+                _fail(str(exc))
+            if not deleted:
                 _fail(f"No user named '{args.username}'.")
             print(f"User '{args.username}' removed, along with any open sessions.")
             if await storage.count_users() == 0:

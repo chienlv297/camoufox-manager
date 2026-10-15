@@ -1,6 +1,6 @@
 """System-level API models."""
 
-from typing import Any, Generic, Literal, TypeVar
+from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -55,7 +55,9 @@ class HealthResponse(BaseModel):
     status: str = Field(..., description="healthy or unhealthy")
     api_version: str
     database: str = Field(..., description="connected or disconnected")
-    profiles_count: int
+    profiles_count: int | None = Field(
+        None, description="Profile count in open local mode; null when authentication is configured"
+    )
 
 
 class SystemStatusResponse(BaseModel):
@@ -94,19 +96,7 @@ class SystemConfigData(BaseModel):
     encryption_enabled: bool
     cors_origins: list[str]
     camoufox_available: bool
-    browser_status: Literal["missing", "downloading", "ready", "failed"]
-    browser_path: str
     uptime_seconds: int
-
-
-class BrowserStatusData(BaseModel):
-    """Camoufox browser installation status."""
-
-    status: Literal["missing", "downloading", "ready", "failed"]
-    progress: int | None = None
-    message: str
-    error: str | None = None
-    path: str
 
 
 class DevicePreset(BaseModel):

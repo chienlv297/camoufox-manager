@@ -6,7 +6,7 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
-from camoufox_pm.core.models import Profile, ProfileStatus, ProxyCheckRecord
+from camoufox_pm.core.models import Profile, ProfileStatus, ProfileTags, ProxyCheckRecord
 from camoufox_pm.core.proxy_check import Level, ProxyCheckResult
 
 
@@ -20,6 +20,7 @@ class ProfileCreateRequest(BaseModel):
     )
     proxy_config: dict[str, Any] | None = Field(None, description="Proxy configuration")
     notes: str | None = Field(None, max_length=1000, description="Notes")
+    tags: ProfileTags = Field(default_factory=list)
     generate_fingerprint: bool = Field(True, description="Generate a fingerprint")
     fingerprint_preset: str | None = Field(
         None,
@@ -61,6 +62,7 @@ class ProfileUpdateRequest(BaseModel):
     browser_settings: dict[str, Any] | None = Field(None)
     proxy_config: dict[str, Any] | None = Field(None)
     notes: str | None = Field(None, max_length=1000)
+    tags: ProfileTags | None = None
     row_version: int | None = Field(
         None,
         description=(
@@ -138,6 +140,8 @@ class ProfileResponse(BaseModel):
 
     id: str
     name: str
+    permissions: dict[str, bool] = Field(default_factory=dict)
+    tags: list[str] = Field(default_factory=list)
     group: str | None
     status: ProfileStatus
     browser_settings: dict[str, Any]
@@ -147,6 +151,7 @@ class ProfileResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     last_used: datetime | None
+    deleted_at: datetime | None = None
     # A short description of the pinned machine, not the stored config itself:
     # that is ~40 properties and tens of kilobytes, which nothing here needs.
     fingerprint: dict[str, Any] | None = Field(
@@ -177,27 +182,50 @@ class ProfileResponse(BaseModel):
     @classmethod
     def from_profile(cls, profile: "Profile") -> "ProfileResponse":
         """Build the API view of a profile."""
+        from camoufox_pm.api.access import is_admin, profile_permissions
         from camoufox_pm.core import fingerprint_store
 
+        proxy_config = profile.proxy.model_dump() if profile.proxy else None
+        if not is_admin() and proxy_config:
+            proxy_config = {
+                key: value
+                for key, value in proxy_config.items()
+                if key not in {"username", "password", "ip_change_url"}
+            }
+            # Legacy proxy servers can contain URL userinfo as well.
+            if "@" in proxy_config.get("server", ""):
+                proxy_config["server"] = proxy_config["server"].rsplit("@", 1)[1]
         return cls(
             id=profile.id,
             name=profile.name,
+            permissions=profile_permissions(profile.id),
             group=profile.group,
+            tags=profile.tags,
             status=profile.status,
             browser_settings=(
                 profile.browser_settings.model_dump() if profile.browser_settings else {}
             ),
-            proxy_config=profile.proxy.model_dump() if profile.proxy else None,
-            storage_path=profile.storage_path,
+            proxy_config=proxy_config,
+            storage_path=profile.storage_path if is_admin() else None,
             notes=profile.notes,
             created_at=profile.created_at,
             updated_at=profile.updated_at,
             last_used=profile.last_used,
+            deleted_at=profile.deleted_at,
             fingerprint=fingerprint_store.summarize(
                 profile.fingerprint,
                 profile.browser_settings.os if profile.browser_settings else None,
             ),
-            proxy_check=profile.proxy_check,
+            proxy_check=(
+                profile.proxy_check
+                if is_admin() or profile.proxy_check is None
+                else profile.proxy_check.model_copy(
+                    update={
+                        "error": "The proxy check failed." if profile.proxy_check.error else None,
+                        "findings": [],
+                    }
+                )
+            ),
             row_version=profile.row_version,
         )
 
@@ -421,3 +449,24 @@ class ProxyCheckResponse(BaseModel):
             ),
             findings=[ProxyFindingResponse(**asdict(f)) for f in result.findings],
         )
+
+
+class TagTarget(BaseModel):
+    id: str = Field(min_length=1, max_length=255)
+    row_version: int = Field(ge=0)
+
+
+class BulkTagsRequest(BaseModel):
+    profiles: list[TagTarget] = Field(min_length=1, max_length=1000)
+    add: ProfileTags = Field(default_factory=list)
+    remove: ProfileTags = Field(default_factory=list)
+
+
+class TagSkipped(BaseModel):
+    id: str
+    reason: str
+
+
+class BulkTagsResponse(BaseModel):
+    updated: list[ProfileResponse]
+    skipped: list[TagSkipped]
