@@ -76,8 +76,10 @@ session cookie. Logout returns the action envelope and clears the cookie.
   send `{"proxy_config": null}` to detach a proxy; omit the key to leave it.
 - Statuses: `400` for a bad request, `401` for missing or wrong credentials
   (API key or login session), `404` for a missing resource, `405` for a method
-  the path does not accept, `409` for a state conflict (exporting a running
-  profile), `422` for values that fail validation, `500` otherwise.
+  the path does not accept, `409` for a state conflict, `422` for values that
+  fail validation, `500` otherwise. `409` covers several conflicts, so it always
+  carries a code that says which: `stale_write` when someone else saved the
+  profile first, `conflict` for a profile that is running or leased elsewhere.
 
 ### Errors
 
@@ -211,6 +213,36 @@ is stored, so sending one field does not reset the rest of the fingerprint. The
 older flattened form (`browser_os`, `browser_timezone`, …) still works and is
 merged the same way, but is deprecated — it goes away in 1.0.
 
+#### Not overwriting someone else's save
+
+Every profile carries a `row_version`, bumped by each save. Send back the one you
+read and a save that landed in between is refused with **`409`** and the code
+`stale_write`, instead of silently reverting it:
+
+```http
+PUT /api/v1/profiles/{id}    {"notes": "...", "row_version": 7}
+```
+
+```json
+{"error": {"code": "stale_write",
+           "message": "Profile … was changed by someone else since it was read; reload it and apply the edit again"}}
+```
+
+Reload the profile, decide what to do with the difference, and retry against the
+`row_version` that comes back. The refusal writes nothing, so nothing is
+half-applied.
+
+Omitting `row_version` keeps the previous behaviour and stays supported: the
+server then guards only against two requests overlapping, which cannot know about
+an edit made against a form loaded minutes ago. Sending it is what protects a
+long-lived form.
+
+Not every write bumps the version. A proxy check and a browser launch write only
+the columns they own — `proxy_check`, and the pinned machine with `last_used` —
+precisely so that a thirty-second proxy check or a launch does not make every open
+edit form fail to save. The consequence is that those writes cannot be guarded
+this way either; nothing else in the API writes a profile without a version.
+
 ### Other actions
 
 ```http
@@ -315,6 +347,13 @@ launch after replays it. Closing the browser window yourself is detected and the
 session is cleaned up, so `/api/v1/browsers/active` reflects reality without
 polling the process table.
 
+Launching a profile that another instance has open returns **`409`**. Each
+launch takes a lease on the profile, and `/api/v1/browsers/active` only sees
+this instance's browsers — the lease is what one instance knows about another's.
+Retry once the holder closes the browser, or wait out `CPM_LEASE_TTL` if that
+instance is gone. There is no force-unlock endpoint: releasing another
+instance's lease needs `camoufox-pm unlock` on the host.
+
 ## Moving a profile
 
 ```http
@@ -327,7 +366,8 @@ The archive carries the profile, its pinned fingerprint and its browser data
 can be restored next to the profile it came from.
 
 - Exporting a **running** profile returns `409` — its databases would be copied
-  mid-write.
+  mid-write. A profile leased by another instance is refused the same way, for
+  the same reason.
 - The archive is **not encrypted** and holds live session cookies and the proxy
   password. Treat it like the account itself.
 

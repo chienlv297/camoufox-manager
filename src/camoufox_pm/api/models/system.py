@@ -1,6 +1,6 @@
 """System-level API models."""
 
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -94,7 +94,19 @@ class SystemConfigData(BaseModel):
     encryption_enabled: bool
     cors_origins: list[str]
     camoufox_available: bool
+    browser_status: Literal["missing", "downloading", "ready", "failed"]
+    browser_path: str
     uptime_seconds: int
+
+
+class BrowserStatusData(BaseModel):
+    """Camoufox browser installation status."""
+
+    status: Literal["missing", "downloading", "ready", "failed"]
+    progress: int | None = None
+    message: str
+    error: str | None = None
+    path: str
 
 
 class DevicePreset(BaseModel):

@@ -11,6 +11,7 @@ from loguru import logger
 from pydantic import ValidationError
 
 from .crypto import decrypt, encrypt
+from .leases import lease_expired
 from .models import (
     Profile,
     ProfileGroup,
@@ -36,6 +37,27 @@ def _deserialize_proxy(data: dict) -> ProxyConfig:
     if data.get("password"):
         data["password"] = decrypt(data["password"])
     return ProxyConfig(**data)
+
+
+class StaleWriteError(Exception):
+    """A save built on an older version of the row than the one stored.
+
+    The optimistic half of this project's concurrency story; core/leases.py is
+    the pessimistic half. A lease answers "who may *run* this profile"; this
+    answers "who may *save* this row", which is a different question because a
+    profile can be edited while nobody is running it.
+
+    Raised when a version-checked update matched no rows: somebody saved first.
+    The later edit is lost loudly instead of silently overwriting theirs.
+    """
+
+    def __init__(self, profile_id: str, expected_row_version: int | None = None):
+        self.profile_id = profile_id
+        self.expected_row_version = expected_row_version
+        super().__init__(
+            f"Profile {profile_id} was changed by someone else since it was read; "
+            "reload it and apply the edit again"
+        )
 
 
 class DatabaseManager:
@@ -68,7 +90,19 @@ class DatabaseManager:
         never touches existing rows.
         """
         added_columns = {
-            "profiles": [("fingerprint", "TEXT"), ("proxy_check", "TEXT")],
+            "profiles": [
+                ("fingerprint", "TEXT"),
+                ("proxy_check", "TEXT"),
+                # Lease columns (see core/leases.py). NULL means free, which is
+                # what an existing row gets when the column is added — every
+                # profile in an upgraded database starts unleased.
+                ("locked_by", "TEXT"),
+                ("lock_expires", "TIMESTAMP"),
+                # Optimistic-concurrency counter. Existing rows start at 0, so
+                # the first version-checked save of an upgraded database has a
+                # version to match against.
+                ("row_version", "BIGINT NOT NULL DEFAULT 0"),
+            ],
         }
         for table, columns in added_columns.items():
             cursor = self._connection.execute(f"PRAGMA table_info({table})")
@@ -98,7 +132,10 @@ class DatabaseManager:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_used TIMESTAMP,
                 fingerprint TEXT,
-                proxy_check TEXT
+                proxy_check TEXT,
+                locked_by TEXT,
+                lock_expires TIMESTAMP,
+                row_version BIGINT NOT NULL DEFAULT 0
             )
         """)
 
@@ -199,35 +236,107 @@ class DatabaseManager:
 
     # --- Profiles ---
 
-    async def save_profile(self, profile: Profile):
-        """Save a profile to the database."""
+    def _profile_columns(self, profile: Profile) -> tuple:
+        """The column values a save owns, in the order both writers use.
+
+        Shared so the upsert and the version-checked update cannot drift apart:
+        a column added to one and forgotten in the other would be written on a
+        create and silently ignored on an edit.
+        """
+        return (
+            profile.id,
+            profile.name,
+            profile.group,
+            profile.status.value if hasattr(profile.status, "value") else profile.status,
+            json.dumps(profile.browser_settings.model_dump()),
+            json.dumps(_serialize_proxy(profile.proxy)) if profile.proxy else None,
+            json.dumps(profile.extensions),
+            profile.storage_path,
+            profile.notes,
+            profile.created_at.isoformat(),
+            profile.updated_at.isoformat(),
+            profile.last_used.isoformat() if profile.last_used else None,
+            json.dumps(profile.fingerprint) if profile.fingerprint else None,
+            profile.proxy_check.model_dump_json() if profile.proxy_check else None,
+        )
+
+    def _upsert_profile(self, profile: Profile) -> None:
+        """Insert the row, or overwrite the columns a save owns.
+
+        An upsert rather than ``INSERT OR REPLACE``, which deletes the row and
+        writes a new one: that would drop the lease and version columns, so
+        renaming a profile would quietly unlock a browser another instance is
+        running. ``DO UPDATE`` names only the columns a save owns, and the ones
+        it does not name keep their values.
+        """
         self._connection.execute(
             """
-            INSERT OR REPLACE INTO profiles (
+            INSERT INTO profiles (
                 id, name, group_id, status, browser_settings, proxy_config,
                 extensions, storage_path, notes, created_at, updated_at, last_used,
                 fingerprint, proxy_check
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                group_id = excluded.group_id,
+                status = excluded.status,
+                browser_settings = excluded.browser_settings,
+                proxy_config = excluded.proxy_config,
+                extensions = excluded.extensions,
+                storage_path = excluded.storage_path,
+                notes = excluded.notes,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at,
+                last_used = excluded.last_used,
+                fingerprint = excluded.fingerprint,
+                proxy_check = excluded.proxy_check
         """,
-            (
-                profile.id,
-                profile.name,
-                profile.group,
-                profile.status.value if hasattr(profile.status, "value") else profile.status,
-                json.dumps(profile.browser_settings.model_dump()),
-                json.dumps(_serialize_proxy(profile.proxy)) if profile.proxy else None,
-                json.dumps(profile.extensions),
-                profile.storage_path,
-                profile.notes,
-                profile.created_at.isoformat(),
-                profile.updated_at.isoformat(),
-                profile.last_used.isoformat() if profile.last_used else None,
-                json.dumps(profile.fingerprint) if profile.fingerprint else None,
-                profile.proxy_check.model_dump_json() if profile.proxy_check else None,
-            ),
+            self._profile_columns(profile),
         )
+
+    async def save_profile(self, profile: Profile, expected_row_version: int | None = None):
+        """Save a profile.
+
+        With ``expected_row_version`` the write lands only while the stored
+        ``row_version`` still matches what the caller read, and bumps it;
+        matching no rows raises ``StaleWriteError`` rather than overwriting
+        whoever got there first. That is what makes editing one profile from
+        two places safe. Without a version the row is written as before.
+
+        Either way the lease columns survive untouched: a save must never break
+        or take another instance's lease.
+        """
+        profile.updated_at = datetime.now()
+        if expected_row_version is None:
+            self._upsert_profile(profile)
+        else:
+            self._save_profile_if_unchanged(profile, expected_row_version)
         self._connection.commit()
         logger.debug(f"Profile {profile.name} saved")
+
+    def _save_profile_if_unchanged(self, profile: Profile, expected_row_version: int) -> None:
+        """One guarded statement: update only while the version still matches.
+
+        Never creates a row. There is nothing to guard on a row that does not
+        exist yet, and silently inserting one would turn "somebody deleted this
+        profile while you were editing it" into a resurrection.
+        """
+        cursor = self._connection.execute(
+            """
+            UPDATE profiles SET
+                name = ?, group_id = ?, status = ?, browser_settings = ?,
+                proxy_config = ?, extensions = ?, storage_path = ?, notes = ?,
+                created_at = ?, updated_at = ?, last_used = ?, fingerprint = ?,
+                proxy_check = ?, row_version = row_version + 1
+            WHERE id = ? AND row_version = ?
+            """,
+            (*self._profile_columns(profile)[1:], profile.id, expected_row_version),
+        )
+        if cursor.rowcount == 0:
+            raise StaleWriteError(profile.id, expected_row_version)
+        # Keep the caller's copy in step with the row it just wrote: the next
+        # edit reads its row_version, and it must be the one this write produced.
+        profile.row_version = expected_row_version + 1
 
     async def get_profile(self, profile_id: str) -> Profile | None:
         """Get a profile by ID."""
@@ -238,10 +347,9 @@ class DatabaseManager:
             return self._row_to_profile(row)
         return None
 
-    async def update_profile(self, profile: Profile):
-        """Update a profile."""
-        profile.updated_at = datetime.now()
-        await self.save_profile(profile)
+    async def update_profile(self, profile: Profile, expected_row_version: int | None = None):
+        """Update a profile, optionally guarded against a concurrent save."""
+        await self.save_profile(profile, expected_row_version)
         logger.debug(f"Profile {profile.name} updated")
 
     async def set_proxy_check(self, profile_id: str, record: ProxyCheckRecord | None) -> None:
@@ -257,6 +365,30 @@ class DatabaseManager:
         self._connection.execute(
             "UPDATE profiles SET proxy_check = ? WHERE id = ?",
             (record.model_dump_json() if record else None, profile_id),
+        )
+        self._connection.commit()
+
+    async def set_launch_pin(
+        self, profile_id: str, fingerprint: dict | None, last_used: datetime
+    ) -> None:
+        """Write only what a launch owns: the pinned machine and the timestamp.
+
+        A targeted write for the same reason as ``set_proxy_check``. A launch
+        resolves a fingerprint, which can fetch the uBlock addon over the
+        network on a fresh install, and writing a whole Profile back after that
+        would revert anything edited while it ran. Naming the two columns a
+        launch actually owns removes the hazard rather than guarding against it,
+        and leaves the row's version alone: starting a browser is not an edit of
+        the profile, so it must not make a concurrent editor's save go stale.
+        """
+        self._connection.execute(
+            "UPDATE profiles SET fingerprint = ?, last_used = ?, updated_at = ? WHERE id = ?",
+            (
+                json.dumps(fingerprint) if fingerprint else None,
+                last_used.isoformat(),
+                last_used.isoformat(),
+                profile_id,
+            ),
         )
         self._connection.commit()
 
@@ -618,6 +750,138 @@ class DatabaseManager:
             for row in cursor.fetchall()
         ]
 
+    # --- Leases ---
+
+    # See core/leases.py for what a lease is and why it exists. Every method
+    # here is a single statement whose WHERE clause carries the decision, so
+    # SQLite's write lock — not the application — picks the winner when two
+    # processes ask at once.
+
+    async def acquire_lease(self, profile_id: str, holder: str, ttl_seconds: int) -> bool:
+        """Take the lease on a profile, if it is free. Never blocks.
+
+        The three arms of the guard are the three ways a lease may be taken:
+        nobody holds it, the holder's TTL ran out (their machine is gone), or
+        we already hold it. That last arm makes re-acquisition idempotent — a
+        process must be able to pick its own lease back up instead of waiting
+        out a TTL it set itself.
+
+        Returns ``False`` without touching the row when someone else holds an
+        unexpired lease; callers turn that into ``ProfileLocked``.
+        """
+        cursor = self._connection.execute(
+            """
+            UPDATE profiles
+               SET locked_by = ?,
+                   lock_expires = datetime('now', '+' || ? || ' seconds')
+             WHERE id = ?
+               AND (locked_by IS NULL
+                    OR locked_by = ?
+                    OR julianday(lock_expires) < julianday('now'))
+            """,
+            (holder, ttl_seconds, profile_id, holder),
+        )
+        # Without the commit the lease lives inside this connection's open
+        # transaction, where no other process can see it — the opposite of
+        # what it is for.
+        self._connection.commit()
+        return cursor.rowcount > 0
+
+    async def renew_lease(self, profile_ids: list[str], holder: str, ttl_seconds: int) -> int:
+        """Push out the expiry of the leases we still hold; returns how many.
+
+        A profile missing from the count has been taken over or has expired.
+        The caller treats that as a lost lease rather than trying to win it
+        back: something else is already driving that identity.
+        """
+        if not profile_ids:
+            return 0
+        placeholders = ",".join("?" for _ in profile_ids)
+        cursor = self._connection.execute(
+            f"""
+            UPDATE profiles
+               SET lock_expires = datetime('now', '+' || ? || ' seconds')
+             WHERE id IN ({placeholders}) AND locked_by = ?
+            """,
+            (ttl_seconds, *profile_ids, holder),
+        )
+        self._connection.commit()
+        return cursor.rowcount
+
+    async def release_lease(self, profile_id: str, holder: str) -> bool:
+        """Hand the lease back, but only if we still hold it.
+
+        Guarded on the holder id so a slow teardown cannot clear the lease of
+        whoever took the profile over after ours expired.
+        """
+        cursor = self._connection.execute(
+            "UPDATE profiles SET locked_by = NULL, lock_expires = NULL "
+            "WHERE id = ? AND locked_by = ?",
+            (profile_id, holder),
+        )
+        self._connection.commit()
+        return cursor.rowcount > 0
+
+    async def force_release_lease(self, profile_id: str) -> str | None:
+        """Clear a lease whoever holds it; returns the holder it was taken from.
+
+        Read then clear, because the UPDATE cannot report the value it just
+        erased. Nothing can interleave: SQLite admits one writer at a time.
+
+        Deliberately absent from the HTTP API. A force-unlock button is the
+        quickest route back to two machines on one identity, so it lives only
+        behind the CLI, where reaching for it means deliberate shell access to
+        the host (``camoufox-pm unlock``).
+        """
+        row = self._connection.execute(
+            "SELECT locked_by FROM profiles WHERE id = ? AND locked_by IS NOT NULL",
+            (profile_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        self._connection.execute(
+            "UPDATE profiles SET locked_by = NULL, lock_expires = NULL WHERE id = ?",
+            (profile_id,),
+        )
+        self._connection.commit()
+        return row["locked_by"]
+
+    async def get_lease(self, profile_id: str) -> tuple[str | None, str | None] | None:
+        """Return ``(locked_by, lock_expires)``, or ``None`` if no such profile.
+
+        A plain read, so it reports an expired lease exactly as stored. Callers
+        asking "is this held right now" pass the expiry through
+        :func:`~camoufox_pm.core.leases.lease_expired`, or simply try to acquire.
+        """
+        cursor = self._connection.execute(
+            "SELECT locked_by, lock_expires FROM profiles WHERE id = ?", (profile_id,)
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return row["locked_by"], row["lock_expires"]
+
+    async def get_lease_holders(self) -> list[dict]:
+        """Every lease in the database, expired ones included, for inspection."""
+        cursor = self._connection.execute(
+            """
+            SELECT id, name, locked_by, lock_expires
+              FROM profiles
+             WHERE locked_by IS NOT NULL
+             ORDER BY id
+            """
+        )
+        return [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "locked_by": row["locked_by"],
+                "lock_expires": row["lock_expires"],
+                "expired": lease_expired(row["lock_expires"]),
+            }
+            for row in cursor.fetchall()
+        ]
+
     # --- Utilities ---
 
     def _row_to_schedule(self, row) -> Schedule:
@@ -686,6 +950,7 @@ class DatabaseManager:
             last_used=datetime.fromisoformat(row["last_used"]) if row["last_used"] else None,
             fingerprint=fingerprint,
             proxy_check=stored_check,
+            row_version=row["row_version"],
         )
 
     async def close(self):
@@ -708,17 +973,22 @@ class StorageManager:
         await self.db.initialize()
 
     # Profile methods
-    async def save_profile(self, profile: Profile):
-        await self.db.save_profile(profile)
+    async def save_profile(self, profile: Profile, expected_row_version: int | None = None):
+        await self.db.save_profile(profile, expected_row_version)
 
     async def get_profile(self, profile_id: str) -> Profile | None:
         return await self.db.get_profile(profile_id)
 
-    async def update_profile(self, profile: Profile):
-        await self.db.update_profile(profile)
+    async def update_profile(self, profile: Profile, expected_row_version: int | None = None):
+        await self.db.update_profile(profile, expected_row_version)
 
     async def set_proxy_check(self, profile_id: str, record: ProxyCheckRecord | None) -> None:
         await self.db.set_proxy_check(profile_id, record)
+
+    async def set_launch_pin(
+        self, profile_id: str, fingerprint: dict | None, last_used: datetime
+    ) -> None:
+        await self.db.set_launch_pin(profile_id, fingerprint, last_used)
 
     async def delete_profile(self, profile_id: str) -> bool:
         return await self.db.delete_profile(profile_id)
@@ -797,6 +1067,25 @@ class StorageManager:
 
     async def list_schedule_runs(self, schedule_id: str, limit: int = 20) -> list[ScheduleRun]:
         return await self.db.list_schedule_runs(schedule_id, limit)
+
+    # Lease methods
+    async def acquire_lease(self, profile_id: str, holder: str, ttl_seconds: int) -> bool:
+        return await self.db.acquire_lease(profile_id, holder, ttl_seconds)
+
+    async def renew_lease(self, profile_ids: list[str], holder: str, ttl_seconds: int) -> int:
+        return await self.db.renew_lease(profile_ids, holder, ttl_seconds)
+
+    async def release_lease(self, profile_id: str, holder: str) -> bool:
+        return await self.db.release_lease(profile_id, holder)
+
+    async def force_release_lease(self, profile_id: str) -> str | None:
+        return await self.db.force_release_lease(profile_id)
+
+    async def get_lease(self, profile_id: str) -> tuple[str | None, str | None] | None:
+        return await self.db.get_lease(profile_id)
+
+    async def get_lease_holders(self) -> list[dict]:
+        return await self.db.get_lease_holders()
 
     async def close(self):
         """Close the database."""

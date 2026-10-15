@@ -20,12 +20,29 @@ from camoufox_pm.api.errors import install_error_handlers
 from camoufox_pm.api.middleware.logging import LoggingMiddleware
 from camoufox_pm.api.models.system import ErrorResponse, HealthResponse
 from camoufox_pm.api.routes import auth, groups, profiles, schedules, system
+from camoufox_pm.browser_runtime import BrowserRuntimeManager, configure_camoufox_runtime
 from camoufox_pm.config import get_settings
 from camoufox_pm.core.database import StorageManager
 from camoufox_pm.core.profile_manager import ProfileManager
 from camoufox_pm.core.scheduler import TaskScheduler
+from camoufox_pm.paths import (
+    bundled_browser_dir,
+    configure_logging,
+    ensure_runtime_dirs,
+    is_windows_standalone,
+    migrate_legacy_data,
+    runtime_paths,
+)
 
 settings = get_settings()
+paths = runtime_paths()
+if is_windows_standalone():
+    paths = ensure_runtime_dirs(paths)
+configure_camoufox_runtime(Path(settings.browser_dir))
+browser_runtime = BrowserRuntimeManager(
+    settings.browser_dir,
+    bundled_browser_dir() if is_windows_standalone() else None,
+)
 
 
 @asynccontextmanager
@@ -33,11 +50,20 @@ async def lifespan(app: FastAPI):
     """Initialize shared resources on startup and clean up on shutdown."""
     logger.info("Starting Camoufox Profile Manager API...")
 
+    if is_windows_standalone():
+        migrate_legacy_data(paths)
+        configure_logging(paths)
+    await browser_runtime.initialize(install_if_missing=is_windows_standalone())
+
     storage_manager = StorageManager(settings.db_path)
     await storage_manager.initialize()
 
-    data_dir = str(Path(settings.db_path).parent)
-    profile_manager = ProfileManager(storage_manager, data_dir)
+    profile_manager = ProfileManager(
+        storage_manager,
+        str(Path(settings.effective_profiles_dir).parent),
+        browser_runtime=browser_runtime,
+        profiles_dir=settings.effective_profiles_dir,
+    )
     await profile_manager.initialize()
 
     set_storage_manager(storage_manager)
@@ -55,7 +81,23 @@ async def lifespan(app: FastAPI):
     finally:
         logger.info("Shutting down API...")
         await scheduler.stop()
+        # Order matters. The heartbeat renews by holder id, so a beat racing the
+        # releases below would read our own cleared lease as a takeover and close
+        # a live browser: stop renewing first.
+        await profile_manager.browser_sessions.stop_heartbeat()
+        # Then close the browsers, which releases their leases as part of the
+        # close. release_all_leases deliberately skips profiles that are still
+        # live, so leaving them open here would leak every lease we hold.
+        try:
+            await profile_manager.browser_sessions.close_all()
+        except Exception as exc:  # noqa: BLE001 - shutdown must not raise
+            logger.warning(f"Failed to close browsers on shutdown: {exc}")
+        # Finally hand back whatever is left. A lease must not outlive the
+        # process that took it, or a restart locks this instance out of its own
+        # profiles for a full TTL.
+        await profile_manager.release_all_leases()
         await storage_manager.close()
+        await browser_runtime.shutdown()
 
 
 app = FastAPI(
@@ -206,4 +248,5 @@ if __name__ == "__main__":
         port=settings.port,
         reload=True,
         log_level="info",
+        log_config=None,
     )

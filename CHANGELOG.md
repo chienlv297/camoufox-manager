@@ -8,6 +8,56 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Nothing yet.
 
+## [0.5.0] - 2026-09-15
+
+Concurrency. Running the manager from two places — a laptop and a server on one
+database, or just the web UI beside a CLI launch — could put one identity in two
+browsers, and could lose an edit without saying so. Both came from the same
+habit: answering "who has this profile" from memory inside a single process, and
+writing the whole row on every save. Both are now decided by the database.
+
+The design for both is Arkadiy Pechnikov's, from a contribution that arrived
+with a PostgreSQL backend attached; the locking half landed first and on its own.
+
+### Added
+- **One instance at a time may open a profile.** Two copies of the manager
+  against the same database — the web UI and a CLI launch on one machine, or two
+  machines sharing a database file — could both open the same profile, because
+  "is it running" was a dictionary inside a single process. One identity in two
+  browsers means one cookie jar written from two places and the same account
+  live from two IPs. Every launch now takes a row-level lease on the profile;
+  a second instance is refused with `409` until the browser closes. The lease is
+  renewed while the browser runs and expires `CPM_LEASE_TTL` seconds (default
+  120, minimum 60) after an instance stops renewing, so a machine that died does
+  not lock its profiles forever. Exporting a profile leased elsewhere is refused
+  the same way: the archive would be copied mid-write.
+- **`camoufox-pm leases` and `camoufox-pm unlock <id>`** show who holds what and
+  force-release a lease. CLI-only on purpose — force-release is the one
+  operation that can put two browsers on one identity, so it takes shell access
+  to the host rather than a button in the UI.
+- **Two people editing one profile no longer overwrite each other.** Every save
+  used to write the whole row, so two open edit forms meant the second save
+  silently reverted the first — no error, no log, the earlier edit simply gone.
+  Profiles now carry a `row_version`; send back the one you read and a save that
+  landed in between is refused with `409` and the code `stale_write`. The web UI
+  turns that into a message naming what changed, keeps everything you typed, and
+  lets a second Save apply your version deliberately. Clients that send no
+  version keep working.
+
+### Changed
+- **Starting a browser no longer writes the whole profile row.** A launch wrote
+  back the Profile it had read, which could revert an edit saved while the
+  fingerprint was being resolved — a wait that reaches the network on a fresh
+  install. It now writes only the two columns a launch owns, the pinned machine
+  and `last_used`, and leaves the row's version alone so starting a browser
+  cannot make a concurrent editor's save fail.
+
+### Fixed
+- **Saving a profile no longer clears its lease.** `save_profile` was an
+  `INSERT OR REPLACE`, which deletes the row and writes a new one; renaming a
+  profile would have wiped the lease columns along with it. It is now an upsert
+  that names only the columns a save owns.
+
 ## [0.4.1] - 2026-09-05
 
 A fix release, and the fix is to 0.4.0's own. Someone questioned the upstream
@@ -585,7 +635,8 @@ First public release after a comprehensive revamp.
   Camoufox owns fingerprint generation for consistency.
 - Committed profile data, leaked proxy credentials, and duplicate/backup files.
 
-[Unreleased]: https://github.com/polyackiy/camoufox-profile-manager/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/polyackiy/camoufox-profile-manager/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/polyackiy/camoufox-profile-manager/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/polyackiy/camoufox-profile-manager/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/polyackiy/camoufox-profile-manager/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/polyackiy/camoufox-profile-manager/compare/v0.2.1...v0.3.0

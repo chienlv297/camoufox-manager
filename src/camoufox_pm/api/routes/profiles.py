@@ -38,7 +38,9 @@ from camoufox_pm.api.models.profiles import (
 )
 from camoufox_pm.api.models.system import ApiResponse, ExcelImportData
 from camoufox_pm.core import proxy_check
+from camoufox_pm.core.database import StaleWriteError
 from camoufox_pm.core.excel_manager import ExcelManager
+from camoufox_pm.core.leases import ProfileLocked
 from camoufox_pm.core.models import BrowserSettings, ProfileStatus, ProxyConfig
 
 router = APIRouter()
@@ -174,6 +176,10 @@ async def get_profile(profile_id: str):
 
     except HTTPException:
         raise
+    except StaleWriteError:
+        # Let it reach the app-level handler, which renders it as 409. The
+        # catch-all below would otherwise report a conflict as a server fault.
+        raise
     except Exception as e:
         logger.error(f"Failed to get profile {profile_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -215,6 +221,10 @@ async def update_profile(profile_id: str, request: ProfileUpdateRequest):
         if "notes" in sent:
             updates["notes"] = sent["notes"]
 
+        # Not a field of the profile: the version this edit was based on, used
+        # to refuse the save if someone else got there first.
+        expected_row_version = sent.get("row_version")
+
         # Browser settings arrive either as a nested object or as the deprecated
         # flattened browser_* fields. Both are collected here and merged over the
         # stored settings, so a client that sends only the fields it edits cannot
@@ -236,7 +246,9 @@ async def update_profile(profile_id: str, request: ProfileUpdateRequest):
                 updates["browser_settings"] = browser_updates
 
         # Apply the update
-        updated_profile = await profile_manager.update_profile(profile_id, updates)
+        updated_profile = await profile_manager.update_profile(
+            profile_id, updates, expected_row_version=expected_row_version
+        )
 
         if not updated_profile:
             raise HTTPException(status_code=404, detail=f"Profile with ID {profile_id} not found")
@@ -246,6 +258,10 @@ async def update_profile(profile_id: str, request: ProfileUpdateRequest):
         return ProfileResponse.from_profile(updated_profile)
 
     except HTTPException:
+        raise
+    except StaleWriteError:
+        # Let it reach the app-level handler, which renders it as 409. The
+        # catch-all below would otherwise report a conflict as a server fault.
         raise
     except ValidationError as e:
         # browser_settings is a free-form dict on the way in, so bad values only
@@ -281,6 +297,10 @@ async def delete_profile(profile_id: str):
         )
 
     except HTTPException:
+        raise
+    except StaleWriteError:
+        # Let it reach the app-level handler, which renders it as 409. The
+        # catch-all below would otherwise report a conflict as a server fault.
         raise
     except Exception as e:
         logger.error(f"Failed to delete profile {profile_id}: {e}")
@@ -326,6 +346,11 @@ async def launch_profile(profile_id: str, request: ProfileLaunchRequest):
             },
         )
 
+    except ProfileLocked as e:
+        # Another instance holds the lease. A conflict, not a fault: the client
+        # can retry once the holder closes the browser, and a 500 would read as
+        # "we broke" for an outcome the design intends.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except Exception as e:
@@ -460,6 +485,10 @@ async def get_profile_stats(profile_id: str):
 
     except HTTPException:
         raise
+    except StaleWriteError:
+        # Let it reach the app-level handler, which renders it as 409. The
+        # catch-all below would otherwise report a conflict as a server fault.
+        raise
     except Exception as e:
         logger.error(f"Failed to get statistics for profile {profile_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -485,6 +514,10 @@ async def refresh_browser_version(profile_id: str):
             raise HTTPException(status_code=404, detail=f"Profile with ID {profile_id} not found")
         return ProfileResponse.from_profile(profile)
     except HTTPException:
+        raise
+    except StaleWriteError:
+        # Let it reach the app-level handler, which renders it as 409. The
+        # catch-all below would otherwise report a conflict as a server fault.
         raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -513,6 +546,10 @@ async def reconcile_profile_os(profile_id: str, request: ReconcileOsRequest):
         return ProfileResponse.from_profile(profile)
     except HTTPException:
         raise
+    except StaleWriteError:
+        # Let it reach the app-level handler, which renders it as 409. The
+        # catch-all below would otherwise report a conflict as a server fault.
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -536,6 +573,10 @@ async def clear_profiles_geography(request: ClearGeographyRequest):
     try:
         result = await get_profile_manager().clear_geography(request.profile_ids)
         return ClearGeographyResponse(**result)
+    except StaleWriteError:
+        # Let it reach the app-level handler, which renders it as 409. The
+        # catch-all below would otherwise report a conflict as a server fault.
+        raise
     except Exception as exc:
         logger.error(f"Failed to clear geography: {exc}")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -567,9 +608,10 @@ async def export_profile(profile_id: str):
 
     try:
         await profile_manager.export_profile(profile_id, destination)
-    except ValueError as exc:
+    except (ValueError, ProfileLocked) as exc:
         destination.unlink(missing_ok=True)
-        # A running browser is a state conflict, not a bad request.
+        # A running browser is a state conflict, not a bad request — whether it
+        # is running here or leased by another instance.
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         destination.unlink(missing_ok=True)
@@ -652,6 +694,10 @@ async def reset_profile_fingerprint(profile_id: str):
         return ProfileResponse.from_profile(updated_profile)
 
     except HTTPException:
+        raise
+    except StaleWriteError:
+        # Let it reach the app-level handler, which renders it as 409. The
+        # catch-all below would otherwise report a conflict as a server fault.
         raise
     except Exception as e:
         logger.error(f"Failed to reset fingerprint for profile {profile_id}: {e}")
@@ -737,6 +783,10 @@ async def import_profiles_from_excel(file: UploadFile = File(...)):
         )
 
     except HTTPException:
+        raise
+    except StaleWriteError:
+        # Let it reach the app-level handler, which renders it as 409. The
+        # catch-all below would otherwise report a conflict as a server fault.
         raise
     except Exception as e:
         logger.error(f"Failed to import profiles from Excel: {e}")

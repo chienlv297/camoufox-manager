@@ -9,6 +9,7 @@ import {
   getApiKey,
   setApiKey,
   systemAPI,
+  type BrowserStatus,
   type SystemConfig,
   type SystemStatus,
 } from '@/lib/api'
@@ -23,6 +24,8 @@ function formatUptime(seconds: number): string {
 export default function SettingsPage() {
   const [config, setConfig] = useState<SystemConfig | null>(null)
   const [status, setStatus] = useState<SystemStatus | null>(null)
+  const [browser, setBrowser] = useState<BrowserStatus | null>(null)
+  const [retryingBrowser, setRetryingBrowser] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [key, setKey] = useState('')
   const toast = useToast()
@@ -36,12 +39,33 @@ export default function SettingsPage() {
       try {
         setConfig(await systemAPI.config())
         setStatus(await systemAPI.status().catch(() => null))
+        setBrowser(await systemAPI.browser().catch(() => null))
       } catch (err) {
         setError(String(err instanceof Error ? err.message : err))
       }
     }
     load()
   }, [])
+
+  useEffect(() => {
+    if (!browser || !['missing', 'downloading'].includes(browser.status)) return
+    const timer = window.setInterval(async () => {
+      setBrowser(await systemAPI.browser().catch(() => browser))
+    }, 2000)
+    return () => window.clearInterval(timer)
+  }, [browser])
+
+  async function retryBrowser() {
+    setRetryingBrowser(true)
+    try {
+      setBrowser(await systemAPI.retryBrowser())
+      toast('ok', 'Camoufox download restarted', 'This window will update when the browser is ready.')
+    } catch (err) {
+      toast('error', 'Could not retry Camoufox download', String(err))
+    } finally {
+      setRetryingBrowser(false)
+    }
+  }
 
   function saveKey(event: React.FormEvent) {
     event.preventDefault()
@@ -134,12 +158,11 @@ export default function SettingsPage() {
             <Row label="Database">
               <span className="break-all font-mono text-ink-dim">{config.database_path}</span>
             </Row>
-            <Toggle
-              on={config.camoufox_available}
-              label="Camoufox browser"
-              onText="Installed and ready to launch profiles."
-              offText="Not installed. Run: camoufox fetch"
-              warnWhenOff
+            <BrowserStatusRow
+              browser={browser}
+              fallbackStatus={config.browser_status}
+              retrying={retryingBrowser}
+              onRetry={retryBrowser}
             />
           </Group>
 
@@ -184,6 +207,62 @@ function Group({
       {note && <p className="mb-2 text-ink-faint">{note}</p>}
       <div className="panel divide-y divide-line">{children}</div>
     </section>
+  )
+}
+
+function BrowserStatusRow({
+  browser,
+  fallbackStatus,
+  retrying,
+  onRetry,
+}: {
+  browser: BrowserStatus | null
+  fallbackStatus: BrowserStatus['status']
+  retrying: boolean
+  onRetry: () => void
+}) {
+  const state = browser?.status ?? fallbackStatus
+  const ready = state === 'ready'
+  const failed = state === 'failed'
+  const downloading = state === 'downloading'
+  const progress = browser?.progress
+  const label = ready ? 'Camoufox browser' : failed ? 'Camoufox browser error' : 'Camoufox browser'
+  const message = browser?.message ?? (ready ? 'Installed and ready to launch profiles.' : 'Checking browser installation…')
+
+  return (
+    <div className="flex gap-4 px-4 py-2.5">
+      <span className="w-[150px] shrink-0 text-ink-dim">{label}</span>
+      <span className="flex flex-1 items-start gap-2">
+        {ready ? (
+          <Check size={14} className="mt-0.5 shrink-0 text-ok" />
+        ) : failed ? (
+          <TriangleAlert size={14} className="mt-0.5 shrink-0 text-danger" />
+        ) : (
+          <Minus size={14} className="mt-0.5 shrink-0 text-ink-faint" />
+        )}
+        <span className="flex min-w-0 flex-1 flex-col gap-1">
+          <span className={failed ? 'text-danger' : ready ? '' : 'text-ink-dim'}>
+            {message}
+            {downloading && progress !== null && progress !== undefined ? ` ${progress}%` : ''}
+          </span>
+          {downloading && (
+            <progress
+              className="h-1.5 w-full"
+              aria-label="Camoufox installation progress"
+              max={100}
+              {...(progress === null || progress === undefined ? {} : { value: progress })}
+            />
+          )}
+          {failed && browser?.error && <span className="break-all text-xs text-ink-faint">{browser.error}</span>}
+          {(failed || state === 'missing') && (
+            <button type="button" className="btn btn-default w-fit" onClick={onRetry} disabled={retrying}>
+              {retrying ? 'Retrying…' : 'Retry download'}
+            </button>
+          )}
+          {browser?.path && <span className="break-all font-mono text-xs text-ink-faint">{browser.path}</span>}
+        </span>
+      </span>
+    </div>
   )
 }
 

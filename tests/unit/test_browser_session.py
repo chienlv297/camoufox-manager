@@ -14,6 +14,23 @@ from camoufox_pm.core.browser_session import (
 )
 
 
+class FakePage:
+    def __init__(self):
+        self.urls: list[str] = []
+        self.url = "about:blank"
+        self.bring_to_front_calls = 0
+
+    async def goto(self, url: str, **_kwargs):
+        self.urls.append(url)
+        self.url = url
+
+    async def bring_to_front(self):
+        self.bring_to_front_calls += 1
+
+    async def close(self):
+        return None
+
+
 class FakeBrowser:
     """Stands in for the Playwright browser/context returned by a launch.
 
@@ -60,14 +77,6 @@ class FakeCamoufox:
         self.exits += 1
         if self.exit_error is not None:
             raise self.exit_error
-
-
-class FakePage:
-    def __init__(self):
-        self.urls: list[str] = []
-
-    async def goto(self, url: str, **_kwargs):
-        self.urls.append(url)
 
 
 @pytest.fixture
@@ -168,6 +177,31 @@ async def test_launching_a_profile_twice_reuses_the_running_browser(installed):
 
 
 @pytest.mark.asyncio
+async def test_initial_urls_reuse_initial_tab_and_repeated_launch_focuses_it(installed):
+    camoufox = installed(FakeCamoufox())
+    mgr = BrowserSessionManager()
+
+    await mgr.launch("p1", {}, initial_urls=["http://127.0.0.1:8787/bootstrap#storeId=CH-0001"])
+    await mgr.launch("p1", {}, initial_urls=["http://127.0.0.1:8787/bootstrap#storeId=CH-0001"])
+
+    assert [page.urls for page in camoufox.browser.pages] == [
+        ["http://127.0.0.1:8787/bootstrap#storeId=CH-0001"],
+    ]
+    assert camoufox.browser.pages[0].bring_to_front_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_launches_start_one_browser(installed):
+    camoufox = installed(FakeCamoufox())
+    mgr = BrowserSessionManager()
+
+    await asyncio.gather(mgr.launch("p1", {}), mgr.launch("p1", {}))
+
+    assert camoufox.starts == 1
+    assert len(mgr.active_sessions) == 1
+
+
+@pytest.mark.asyncio
 async def test_a_failed_launch_leaves_nothing_running(installed):
     """A half-registered session would make the profile unlaunchable forever:
     every later attempt would report it as already running."""
@@ -201,18 +235,6 @@ async def test_no_watchdog_is_started_when_no_process_id_could_be_resolved(insta
 
     assert session.process_id is None
     assert session.monitor_task is None
-
-
-@pytest.mark.asyncio
-async def test_initial_urls_navigate_the_launched_context_page(installed):
-    browser = FakeBrowser()
-    installed(FakeCamoufox(browser=browser))
-    mgr = BrowserSessionManager()
-
-    await mgr.launch("p1", {"initial_urls": ["https://www.vinted.com/"]})
-
-    assert len(browser.pages) == 1
-    assert browser.pages[0].urls == ["https://www.vinted.com/"]
 
 
 # -- The user closes the window ------------------------------------------------

@@ -4,13 +4,14 @@ import time
 from pathlib import Path
 
 import psutil
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from loguru import logger
 
 from camoufox_pm import __version__
 from camoufox_pm.api.dependencies import get_profile_manager, get_storage_manager
 from camoufox_pm.api.models.system import (
     ApiResponse,
+    BrowserStatusData,
     DevicePreset,
     PresetListData,
     ProfileCleanupResponse,
@@ -19,6 +20,7 @@ from camoufox_pm.api.models.system import (
     SystemInfoData,
     SystemStatusResponse,
 )
+from camoufox_pm.browser_runtime import BrowserRuntimeManager
 from camoufox_pm.config import get_settings
 from camoufox_pm.core import fingerprint_store
 from camoufox_pm.core.browser_session import CAMOUFOX_AVAILABLE
@@ -39,8 +41,43 @@ def _cleanup_manager() -> ProfileCleanupManager:
     concluded that every profile directory on disk was an orphan, and deleted
     them all.
     """
-    db_path = Path(get_settings().db_path)
-    return ProfileCleanupManager(str(db_path.parent), str(db_path))
+    settings = get_settings()
+    return ProfileCleanupManager(
+        str(Path(settings.db_path).parent),
+        settings.db_path,
+        profiles_dir=settings.effective_profiles_dir,
+    )
+
+
+def _browser_runtime() -> BrowserRuntimeManager:
+    from camoufox_pm.main import browser_runtime
+
+    return browser_runtime
+
+
+@router.get(
+    "/system/browser",
+    response_model=BrowserStatusData,
+    operation_id="get_browser_status",
+    summary="Report Camoufox browser installation status.",
+)
+async def get_browser_status():
+    return BrowserStatusData(**_browser_runtime().snapshot())
+
+
+@router.post(
+    "/system/browser/retry",
+    response_model=BrowserStatusData,
+    operation_id="retry_browser_download",
+    summary="Retry Camoufox browser installation.",
+)
+async def retry_browser_download(request: Request):
+    origin = request.headers.get("origin")
+    if request.headers.get("sec-fetch-site") == "cross-site" or (
+        origin and origin.rstrip("/") != str(request.base_url).rstrip("/")
+    ):
+        raise HTTPException(status_code=403, detail="Cross-origin browser installation is blocked")
+    return BrowserStatusData(**await _browser_runtime().retry())
 
 
 @router.get(
@@ -219,6 +256,8 @@ async def get_system_config():
             encryption_enabled=bool(settings.secret_key),
             cors_origins=settings.cors_origins,
             camoufox_available=CAMOUFOX_AVAILABLE,
+            browser_status=_browser_runtime().snapshot()["status"],
+            browser_path=_browser_runtime().snapshot()["path"],
             uptime_seconds=int(time.time() - startup_time),
         ),
     )

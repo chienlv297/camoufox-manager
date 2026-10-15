@@ -1,11 +1,13 @@
 """Integration tests for the system API, including its two destructive endpoints."""
 
 import shutil
+from unittest.mock import AsyncMock
 
 import pytest
 
 from camoufox_pm.api import dependencies
 from camoufox_pm.api.dependencies import get_profile_manager
+from camoufox_pm.api.routes import system
 from camoufox_pm.config import get_settings
 from camoufox_pm.core.browser_session import BrowserSession
 
@@ -176,3 +178,37 @@ async def test_the_config_endpoint_reports_secrets_as_set_but_never_their_values
         assert "top-secret-encryption" not in response.text
     finally:
         get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_browser_status_and_retry_block_cross_site_requests(client, monkeypatch):
+    snapshot = {
+        "status": "failed",
+        "progress": None,
+        "message": "Download failed",
+        "error": "Network unavailable",
+        "path": "C:\\Users\\Test\\browser",
+    }
+    runtime = type(
+        "FakeRuntime",
+        (),
+        {
+            "snapshot": lambda self: snapshot,
+            "retry": AsyncMock(return_value={**snapshot, "status": "missing"}),
+        },
+    )()
+    monkeypatch.setattr(system, "_browser_runtime", lambda: runtime)
+    response = await client.get("/api/v1/system/browser")
+    assert response.status_code == 200
+    assert response.json() == snapshot
+
+    response = await client.post(
+        "/api/v1/system/browser/retry", headers={"Origin": "https://untrusted.example"}
+    )
+    assert response.status_code == 403
+    runtime.retry.assert_not_awaited()
+
+    response = await client.post("/api/v1/system/browser/retry", headers={"Origin": "http://test"})
+    assert response.status_code == 200
+    assert response.json()["status"] == "missing"
+    runtime.retry.assert_awaited_once()

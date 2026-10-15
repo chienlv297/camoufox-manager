@@ -131,6 +131,51 @@ uv run camoufox-pm --desktop
 Or build a standalone app that needs neither Python nor Node:
 `python scripts/build_desktop.py`.
 
+### Windows standalone build
+
+Developer builds require Python 3.11+, uv, Node.js 20.9+ and Inno Setup 6 on the build machine. End users
+only need the generated installer; they do not need Python, Node.js, npm, uv or
+Git.
+
+```powershell
+.\scripts\build_windows.ps1
+```
+
+Useful options:
+
+```powershell
+.\scripts\build_windows.ps1 -Clean
+.\scripts\build_windows.ps1 -BundleCamoufox
+```
+
+The build creates a PyInstaller `onedir` bundle and an Inno Setup installer:
+
+```text
+release/CamoufoxProfileManager-Setup-x.y.z.exe
+release/CamoufoxProfileManager-Setup.exe
+```
+
+The default lightweight installer downloads Camoufox on first run into
+`%LOCALAPPDATA%\CamoufoxProfileManager\browser`. `-BundleCamoufox` includes a
+browser copy in the installer for first-run offline use. Application data stays
+under `%LOCALAPPDATA%\CamoufoxProfileManager` and survives app updates and
+uninstall/reinstall.
+
+The desktop interface uses Microsoft Edge WebView2 Runtime. If it is missing,
+the app reports a startup error instead of using an incompatible legacy web engine.
+The full browser bundle does not include WebView2 Runtime. Download failures are
+shown in Settings with progress/status and a **Retry download** button. Runtime
+logs rotate under `%LOCALAPPDATA%\CamoufoxProfileManager\logs\app.log`; local
+configuration lives in `config\.env` under the same user-data root. Legacy
+installation-local data is copied on first run without deleting its source.
+
+End-user flow:
+
+1. Download `CamoufoxProfileManager-Setup.exe`.
+2. Double-click it.
+3. Click **Install**.
+4. Launch Camoufox Profile Manager from Desktop or Start Menu.
+
 ### With Docker
 
 ```bash
@@ -165,6 +210,7 @@ Settings come from environment variables (prefix `CPM_`). Copy `.env.example` to
 | `CPM_HOST`         | `127.0.0.1`             | Bind address                                    |
 | `CPM_PORT`         | `8000`                  | Port                                            |
 | `CPM_DB_PATH`      | `data/profiles.db`      | SQLite database path                            |
+| `CPM_LEASE_TTL`    | `120`                   | Seconds a profile's lease survives without a heartbeat — how long a crashed instance keeps its profiles locked. Minimum 60 |
 | `CPM_SECRET_KEY`   | *(empty)*               | Fernet key; encrypts proxy passwords at rest    |
 | `CPM_API_KEY`      | *(empty)*               | If set, required as the `X-API-Key` header (machine clients) |
 | `CPM_SESSION_TTL_HOURS` | `168`              | Login session lifetime, in hours                |
@@ -181,6 +227,39 @@ uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_
 User accounts for the web UI are managed from the CLI: `camoufox-pm user add
 <name>` creates one, and from then on the API and UI require a login (see
 [SECURITY.md](SECURITY.md#authentication)).
+
+### Running more than one instance
+
+Two instances against one database — the web UI and a CLI launch on the same
+machine, or two machines sharing a database file — must not open the same
+profile at once. One identity in two browsers means one cookie jar written from
+two places and the same account live from two IPs, which is exactly the
+correlation a profile exists to avoid.
+
+Each launch therefore takes a **lease** on the profile, and a second instance is
+refused (`409` over the API) until the browser closes. A lease is renewed while
+the browser runs and expires `CPM_LEASE_TTL` seconds after an instance stops
+renewing, so a machine that died does not lock its profiles forever.
+
+```bash
+camoufox-pm leases          # who holds what
+camoufox-pm unlock <id>     # force-release, after checking the holder is gone
+```
+
+Force-release is CLI-only by design: it is the one operation that can put two
+browsers on one identity, so it takes shell access to the host rather than a
+button in the UI.
+
+Editing is protected separately, because a profile is usually edited while
+nobody is running it. Each save carries the version it was based on, so two
+people editing the same profile no longer overwrite each other: the second save
+is refused, and the web UI says what changed and lets you apply your version
+deliberately rather than losing either edit.
+
+Sharing the database file itself is safe between processes on one machine.
+Across machines it needs a filesystem whose locking SQLite can trust — which
+rules out most NFS and SMB mounts, where a lease may be read as free while
+another host holds it.
 
 ## Documentation
 

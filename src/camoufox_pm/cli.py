@@ -18,6 +18,9 @@ from typing import NoReturn
 import uvicorn
 
 from camoufox_pm.config import get_settings
+from camoufox_pm.core.database import StorageManager
+from camoufox_pm.core.leases import lease_expired
+from camoufox_pm.paths import is_windows_standalone
 
 
 def main() -> None:
@@ -27,7 +30,12 @@ def main() -> None:
         description="Run the Camoufox Profile Manager (API + web UI) on one port.",
     )
     parser.add_argument("--host", default=settings.host, help="Bind address")
-    parser.add_argument("--port", type=int, default=settings.port, help="Port")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Port; packaged desktop mode chooses a free port when omitted",
+    )
     parser.add_argument("--no-browser", action="store_true", help="Do not open a browser")
     parser.add_argument(
         "--desktop",
@@ -68,10 +76,45 @@ def main() -> None:
 
     user_commands.add_parser("list", help="List accounts (never shows password hashes)")
 
+    # Shell-only on purpose, like the user commands above. A force-unlock in the
+    # HTTP API would become a button, and a button is the shortest path back to
+    # two machines driving one identity — the corruption the lease prevents.
+    unlock = subcommands.add_parser(
+        "unlock",
+        help="Force-release the lease on a profile",
+        description=(
+            "Clear the lease holding a profile, whatever it says. Needed only when a "
+            "machine died in a way its lease cannot notice, or when you have checked "
+            "that the holder is really gone: a live lease means another instance may "
+            "be driving this profile right now."
+        ),
+    )
+    unlock.add_argument("profile_id")
+    unlock.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
+
+    subcommands.add_parser(
+        "leases",
+        help="List the profiles currently leased, and by whom",
+    )
+
     args = parser.parse_args()
+    if args.port is None:
+        args.port = (
+            0
+            if args.desktop and is_windows_standalone() and "port" not in settings.model_fields_set
+            else settings.port
+        )
 
     if args.command == "user":
         asyncio.run(_run_user_command(args))
+        return
+
+    if args.command == "unlock":
+        asyncio.run(_run_unlock_command(args))
+        return
+
+    if args.command == "leases":
+        asyncio.run(_run_leases_command())
         return
 
     # Make the settings match what we are about to bind, so everything that reads
@@ -95,7 +138,16 @@ def main() -> None:
     # PyInstaller bundle where uvicorn cannot resolve the module by name.
     from camoufox_pm.main import app
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    if is_windows_standalone():
+        uvicorn.run(
+            app,
+            host=args.host,
+            port=args.port,
+            log_level="info",
+            log_config=None,
+        )
+    else:
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
 def _fail(message: str) -> NoReturn:
@@ -116,6 +168,54 @@ def _read_password(args: argparse.Namespace) -> str:
     if len(password) < MIN_PASSWORD_LENGTH:
         _fail(f"Password must be at least {MIN_PASSWORD_LENGTH} characters.")
     return password
+
+
+async def _run_unlock_command(args: argparse.Namespace) -> None:
+    """Force-release one profile's lease; shell-only (see the parser)."""
+    storage = StorageManager(get_settings().db_path)
+    await storage.initialize()
+    try:
+        lease = await storage.get_lease(args.profile_id)
+        if lease is None:
+            _fail(f"No profile with ID '{args.profile_id}'.")
+        holder, expires = lease
+        if holder is None:
+            print(f"Profile {args.profile_id} is not leased.")
+            return
+        state = "expired" if lease_expired(expires) else "live"
+        print(
+            f"Profile {args.profile_id} is leased by {holder}"
+            + (f" until {expires} UTC ({state})" if expires else " (no expiry)")
+        )
+        if not args.yes and input("Force-release this lease? (yes/no): ").strip().lower() not in (
+            "yes",
+            "y",
+        ):
+            print("Cancelled; the lease stands.")
+            return
+        previous = await storage.force_release_lease(args.profile_id)
+        print(f"Lease released (was held by {previous}).")
+    finally:
+        await storage.close()
+
+
+async def _run_leases_command() -> None:
+    """Show who holds what, so `unlock` is a decision and not a guess."""
+    storage = StorageManager(get_settings().db_path)
+    await storage.initialize()
+    try:
+        holders = await storage.get_lease_holders()
+        if not holders:
+            print("No profiles are leased.")
+            return
+        for entry in holders:
+            state = "expired" if entry["expired"] else "live"
+            print(
+                f"{entry['id']}  {entry['name']}  {entry['locked_by']}  "
+                f"expires {entry['lock_expires']} UTC ({state})"
+            )
+    finally:
+        await storage.close()
 
 
 async def _run_user_command(args: argparse.Namespace) -> None:

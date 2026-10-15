@@ -1,5 +1,6 @@
 """Browser profile manager."""
 
+import asyncio
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -7,10 +8,14 @@ from typing import Any
 
 from loguru import logger
 
+from camoufox_pm.browser_runtime import BrowserRuntimeManager
+from camoufox_pm.config import get_settings
+
 from . import fingerprint_store, profile_archive, proxy_check
 from .browser_session import BrowserSessionManager
-from .database import StorageManager
+from .database import StaleWriteError, StorageManager
 from .fingerprint_generator import FingerprintGenerator
+from .leases import ProfileLocked, lease_expired, make_lease_holder
 from .models import (
     BrowserSettings,
     Profile,
@@ -24,14 +29,23 @@ from .models import (
 class ProfileManager:
     """Manage browser profiles: CRUD, cloning, export/import, groups."""
 
-    def __init__(self, storage_manager: StorageManager, data_dir: str = "data"):
+    def __init__(
+        self,
+        storage_manager: StorageManager,
+        data_dir: str = "data",
+        browser_runtime: BrowserRuntimeManager | None = None,
+        profiles_dir: str | None = None,
+    ):
         self.storage = storage_manager
         self.data_dir = Path(data_dir)
-        self.profiles_dir = self.data_dir / "profiles"
+        self.profiles_dir = Path(profiles_dir) if profiles_dir else self.data_dir / "profiles"
+        self.browser_runtime = browser_runtime
         self.fingerprint_generator = FingerprintGenerator()
 
-        # Active browser sessions are owned by a dedicated manager.
-        self.browser_sessions = BrowserSessionManager()
+        # Active browser sessions are owned by a dedicated manager, which also
+        # renews this process's leases for as long as its browsers are open.
+        self.lease_holder = make_lease_holder()
+        self.browser_sessions = BrowserSessionManager(storage_manager, self.lease_holder)
 
         self.profiles_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Initialized ProfileManager with data directory: {self.data_dir}")
@@ -39,6 +53,7 @@ class ProfileManager:
     async def initialize(self):
         """Initialize the profile manager and its database."""
         await self.storage.initialize()
+        self.browser_sessions.start_heartbeat()
         logger.info("ProfileManager initialized")
 
     async def create_profile(
@@ -167,13 +182,31 @@ class ProfileManager:
             logger.warning(f"Profile with ID {profile_id} not found")
         return profile
 
-    async def update_profile(self, profile_id: str, updates: dict[str, Any]) -> Profile | None:
-        """Update a profile."""
+    async def update_profile(
+        self,
+        profile_id: str,
+        updates: dict[str, Any],
+        expected_row_version: int | None = None,
+    ) -> Profile | None:
+        """Update a profile, refusing to overwrite a save we did not see.
+
+        ``expected_row_version`` is the version the *caller* read — a client
+        that loaded an edit form minutes ago passes the version it was shown,
+        and a save that landed since makes this raise ``StaleWriteError``
+        instead of reverting it. Omitted, the guard falls back to the version
+        read here, which still catches two requests interleaving but cannot
+        know about the edit the client never saw.
+        """
         logger.info(f"Updating profile {profile_id}")
 
         profile = await self.get_profile(profile_id)
         if not profile:
             return None
+        guard = profile.row_version if expected_row_version is None else expected_row_version
+        if guard != profile.row_version:
+            # Stale before a single field is applied: the client is editing a
+            # version of this profile that no longer exists.
+            raise StaleWriteError(profile_id, expected_row_version)
 
         proxy_before = profile.proxy
 
@@ -232,8 +265,9 @@ class ProfileManager:
 
         profile.updated_at = datetime.now()
 
-        # Persist the update
-        await self.storage.update_profile(profile)
+        # Version-checked: a save that landed while this edit was being made
+        # must surface as a conflict, not quietly replace the other one.
+        await self.storage.update_profile(profile, expected_row_version=guard)
 
         # Log the update
         await self.storage.log_usage(
@@ -383,7 +417,10 @@ class ProfileManager:
         profile.updated_at = datetime.now()
 
         # Persist the change
-        await self.storage.update_profile(profile)
+        # Version-checked for the same reason an edit is: this reads the row,
+        # changes it and writes it back, so a save that lands in between would
+        # otherwise be reverted without a word.
+        await self.storage.update_profile(profile, expected_row_version=profile.row_version)
 
         # Log the rotation
         await self.storage.log_usage(
@@ -597,7 +634,10 @@ class ProfileManager:
         )
         after = fingerprint_store.browser_major(profile.fingerprint)
         profile.updated_at = datetime.now()
-        await self.storage.update_profile(profile)
+        # Version-checked for the same reason an edit is: this reads the row,
+        # changes it and writes it back, so a save that lands in between would
+        # otherwise be reverted without a word.
+        await self.storage.update_profile(profile, expected_row_version=profile.row_version)
 
         await self.storage.log_usage(
             UsageStats(
@@ -654,7 +694,10 @@ class ProfileManager:
                 profile.browser_settings.screen = f"{width}x{height}"
 
         profile.updated_at = datetime.now()
-        await self.storage.update_profile(profile)
+        # Version-checked for the same reason an edit is: this reads the row,
+        # changes it and writes it back, so a save that lands in between would
+        # otherwise be reverted without a word.
+        await self.storage.update_profile(profile, expected_row_version=profile.row_version)
         await self.storage.log_usage(
             UsageStats(
                 profile_id=profile_id,
@@ -700,7 +743,10 @@ class ProfileManager:
                 unchanged.append(profile_id)
                 continue
             profile.updated_at = datetime.now()
-            await self.storage.update_profile(profile)
+            # Version-checked for the same reason an edit is: this reads the
+            # row, changes it and writes it back, so a save that lands in
+            # between would otherwise be reverted without a word.
+            await self.storage.update_profile(profile, expected_row_version=profile.row_version)
             await self.storage.log_usage(
                 UsageStats(profile_id=profile_id, action="clear_geography", details={})
             )
@@ -714,14 +760,23 @@ class ProfileManager:
     async def export_profile(self, profile_id: str, destination: Path) -> Path:
         """Write a profile and its browser data to an archive.
 
-        Refuses while the browser is open: the databases would be copied
-        mid-write and the restored profile could come back corrupted.
+        Refuses while the browser is open — here or on any other instance —
+        because the databases would be copied mid-write and the restored
+        profile could come back corrupted.
         """
         profile = await self.get_profile(profile_id)
         if not profile:
             raise ValueError(f"Profile with ID {profile_id} not found")
         if self.browser_sessions.is_running(profile_id):
             raise ValueError("Close the browser before exporting this profile")
+        # The lease is the fleet-wide half of that check: active_sessions only
+        # knows about browsers this process started, so without it an export on
+        # one machine would copy the databases of a profile running on another,
+        # mid-write. An expired lease reads as free — that machine is gone.
+        lease = await self.storage.get_lease(profile_id)
+        if lease is not None and lease[0] not in (None, self.lease_holder):
+            if not lease_expired(lease[1]):
+                raise ProfileLocked(profile_id, lease[0])
 
         data_dir = Path(profile.get_storage_path(str(self.profiles_dir)))
         profile_archive.export_profile(profile, data_dir, destination)
@@ -777,70 +832,131 @@ class ProfileManager:
         window_size: str | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Launch a Camoufox browser for a profile."""
-        profile = await self.get_profile(profile_id)
-        if not profile:
-            raise ValueError(f"Profile with ID {profile_id} not found")
+        """Launch a Camoufox browser for a profile.
 
-        if self.browser_sessions.is_running(profile_id):
-            session = self.browser_sessions.active_sessions[profile_id]
-            return {
-                "status": "already_running",
-                "profile_id": profile_id,
-                "message": "Browser is already running for this profile",
-                "process_id": session.process_id,
-            }
+        The lease is taken first and is the authority on "is this profile
+        already running". ``active_sessions`` below is only a fast local path:
+        it cannot see the web UI running beside this CLI, or the instance on
+        another machine, and two of those answering "free" at once is the whole
+        problem (see core/leases.py).
+        """
+        initial_urls = kwargs.pop("initial_urls", None)
+        if initial_urls is not None and (
+            not isinstance(initial_urls, list)
+            or any(not isinstance(url, str) or not url.strip() for url in initial_urls)
+        ):
+            raise ValueError("initial_urls must be a list of non-empty strings")
+        initial_urls = [url.strip() for url in initial_urls or []]
+        if self.browser_runtime is not None:
+            await self.browser_runtime.ensure_ready()
 
-        options = profile.to_camoufox_launch_options()
-        options["headless"] = headless
-        if window_size:
-            # Camoufox expects a (width, height) tuple, not a "1280x720" string.
-            try:
-                width, height = (int(part) for part in window_size.lower().split("x"))
-                options["window"] = (width, height)
-            except ValueError:
-                logger.warning(f"Ignoring invalid window_size {window_size!r} (expected WxH)")
-        options.update(kwargs)
+        acquired = await self.storage.acquire_lease(
+            profile_id, self.lease_holder, get_settings().lease_ttl
+        )
+        if not acquired:
+            # The acquire is a conditional UPDATE, so it reports the same "no
+            # rows changed" for a profile that is leased and for one that does
+            # not exist. get_lease tells them apart: None means no such row,
+            # and that is a 404, not a conflict.
+            lease = await self.storage.get_lease(profile_id)
+            if lease is None:
+                raise ValueError(f"Profile with ID {profile_id} not found")
+            raise ProfileLocked(profile_id, lease[0])
 
-        # Pin the machine on the first launch and replay it on every one after,
-        # so the profile is the same computer each session instead of new
-        # hardware every time. The profile's own overrides still win, and geo,
-        # timezone and WebRTC stay dynamic so they follow the proxy.
-        pinned = profile.fingerprint
-        if not pinned:
-            # Deliberately synchronous. There is no await between reading the
-            # profile above and writing it below, which is what makes this
-            # read-modify-write atomic: save_profile rewrites the whole row, so
-            # an await here would let a concurrent rename be silently reverted.
-            # resolve() can do network I/O (it fetches the uBlock addon on a
-            # fresh install), so offloading it to a thread is tempting — do that
-            # only together with row-level concurrency control.
-            pinned = fingerprint_store.resolve(options)
+        # Everything from here to a launched browser runs on that lease, and if
+        # any of it raises the lease has to go back before the error escapes.
+        # Otherwise the profile is locked for a full TTL with no browser running
+        # anywhere — worse than having no leases at all.
+        #
+        # On success it is deliberately kept: the session owns it until the
+        # browser closes (or the process exits, where the API lifespan calls
+        # release_all_leases).
+        try:
+            profile = await self.get_profile(profile_id)
+            if not profile:
+                raise ValueError(f"Profile with ID {profile_id} not found")
+
+            if self.browser_sessions.is_running(profile_id):
+                # Our own process, so the acquire above re-took our own lease
+                # and the running browser still owns it. Returning here must
+                # not release: that would open a window for another instance
+                # while our browser is alive.
+                session = self.browser_sessions.active_sessions[profile_id]
+                await self.browser_sessions.activate(profile_id)
+                return {
+                    "status": "already_running",
+                    "profile_id": profile_id,
+                    "message": "Browser is already running for this profile",
+                    "process_id": session.process_id,
+                }
+
+            options = profile.to_camoufox_launch_options()
+            options["headless"] = headless
+            if window_size:
+                # Camoufox expects a (width, height) tuple, not a "1280x720" string.
+                try:
+                    width, height = (int(part) for part in window_size.lower().split("x"))
+                    options["window"] = (width, height)
+                except ValueError:
+                    logger.warning(f"Ignoring invalid window_size {window_size!r} (expected WxH)")
+            options.update(kwargs)
+
+            # Pin the machine on the first launch and replay it on every one after,
+            # so the profile is the same computer each session instead of new
+            # hardware every time. The profile's own overrides still win, and geo,
+            # timezone and WebRTC stay dynamic so they follow the proxy.
+            pinned = profile.fingerprint
+            if not pinned:
+                # resolve() can do network I/O (it fetches the uBlock addon on a
+                # fresh install). It used to have to stay synchronous, because
+                # the whole Profile was written back afterwards and an await here
+                # would let a concurrent rename be reverted. The write below now
+                # names only the columns a launch owns, so there is nothing left
+                # for an await to clobber; moving this off the event loop is a
+                # separate change, and this comment is the note that it is safe.
+                pinned = fingerprint_store.resolve(options)
+                if pinned:
+                    profile.fingerprint = pinned
             if pinned:
-                profile.fingerprint = pinned
-        if pinned:
-            options["config"] = {**pinned, **options.get("config", {})}
+                options["config"] = {**pinned, **options.get("config", {})}
 
-        # One write for both the pin and the timestamp, after the options are
-        # built, so neither can be clobbered by a stale copy of the profile.
-        profile.last_used = datetime.now()
-        profile.updated_at = datetime.now()
-        await self.storage.update_profile(profile)
+            # A targeted write of the two columns a launch owns, not a whole
+            # Profile: writing the row back would revert anything edited while
+            # the fingerprint above was being resolved, and would bump a version
+            # a concurrent editor is holding. Starting a browser is not an edit.
+            profile.last_used = datetime.now()
+            profile.updated_at = profile.last_used
+            await self.storage.set_launch_pin(profile_id, profile.fingerprint, profile.last_used)
 
-        await self.storage.log_usage(
-            UsageStats(
-                profile_id=profile_id, action="launch_browser", details={"headless": headless}
+            await self.storage.log_usage(
+                UsageStats(
+                    profile_id=profile_id, action="launch_browser", details={"headless": headless}
+                )
             )
-        )
 
-        # After the write on purpose: this only touches the launch options, so it
-        # cannot clobber the row, and it is the first await that is allowed to run
-        # between reading the profile and saving it.
-        await proxy_check.fill_what_geoip_would_have(profile.proxy, options)
+            # After the write on purpose: this only touches the launch options, so it
+            # cannot clobber the row, and it is the first await that is allowed to run
+            # between reading the profile and saving it.
+            await proxy_check.fill_what_geoip_would_have(profile.proxy, options)
 
-        session = await self.browser_sessions.launch(
-            profile_id, options, on_exit=self._on_browser_exit
-        )
+            launch_kwargs: dict[str, Any] = {"on_exit": self._on_browser_exit}
+            if initial_urls:
+                launch_kwargs["initial_urls"] = initial_urls
+            session = await self.browser_sessions.launch(profile_id, options, **launch_kwargs)
+        except (Exception, asyncio.CancelledError):
+            # CancelledError is a BaseException, not an Exception: an HTTP client
+            # that disconnects mid-launch cancels this coroutine, and a lease must
+            # never outlive a launch that produced no browser. Re-raised below, as
+            # cancellation semantics require.
+            #
+            # Guarded on is_live because the lease is keyed by a process-wide
+            # holder id: a second concurrent launch of the same profile holds the
+            # very same lease, so releasing on this one's failure would unlock the
+            # other one's live browser. Only a failure that leaves nothing running
+            # may hand the lease back.
+            if not self.browser_sessions.is_live(profile_id):
+                await self._release_lease_quietly(profile_id)
+            raise
         return {
             "status": "launched",
             "profile_id": profile_id,
@@ -859,8 +975,8 @@ class ProfileManager:
             logger.warning(f"Failed to log browser exit for {profile_id}: {exc}")
 
     async def close_browser(self, profile_id: str) -> dict[str, Any]:
-        """Close the browser running for a profile."""
-        closed = await self.browser_sessions.close(profile_id)
+        """Close the browser running for a profile, and hand its lease back."""
+        closed = await self.browser_sessions.close_and_release(profile_id)
         if not closed:
             return {
                 "status": "not_running",
@@ -889,3 +1005,37 @@ class ProfileManager:
             "errors": [],
             "message": f"Closed {count} browsers",
         }
+
+    async def _release_lease_quietly(self, profile_id: str) -> None:
+        """Release a lease without letting the release's own failure surface.
+
+        Called on paths that are already handling an error, where a second
+        exception would replace the first and hide what actually went wrong.
+        """
+        try:
+            await self.storage.release_lease(profile_id, self.lease_holder)
+        except Exception as exc:  # noqa: BLE001 - never mask the original failure
+            logger.warning(f"Failed to release the lease on {profile_id}: {exc}")
+
+    async def release_all_leases(self) -> None:
+        """Hand back every lease this process holds — the exit counterpart to launch.
+
+        Without it a clean shutdown leaves leases standing for their full TTL,
+        locking this instance's profiles against the whole fleet, including
+        against itself after a restart. Guarded on the holder id, so another
+        instance's lease is never touched, and it never raises: one stuck
+        profile must not keep the rest locked.
+        """
+        try:
+            holders = await self.storage.get_lease_holders()
+        except Exception as exc:  # noqa: BLE001 - shutdown must not raise
+            logger.warning(f"Could not enumerate leases to release on shutdown: {exc}")
+            return
+        for entry in holders:
+            if entry.get("locked_by") != self.lease_holder:
+                continue
+            # A browser still up owns its lease: releasing it here would let
+            # another instance take an identity this process is still driving.
+            if self.browser_sessions.is_live(entry["id"]):
+                continue
+            await self._release_lease_quietly(entry["id"])

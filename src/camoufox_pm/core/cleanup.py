@@ -19,7 +19,12 @@ from camoufox_pm.core.models import Profile
 class ProfileCleanupManager:
     """Reconcile profile directories on disk with the database."""
 
-    def __init__(self, data_dir: str = "data", db_path: str | None = None):
+    def __init__(
+        self,
+        data_dir: str = "data",
+        db_path: str | None = None,
+        profiles_dir: str | None = None,
+    ):
         """``db_path`` must be the database the application itself uses.
 
         Deriving it from ``data_dir`` assumes the file is called ``profiles.db``.
@@ -28,7 +33,7 @@ class ProfileCleanupManager:
         reported, and removed, as an orphan.
         """
         self.data_dir = Path(data_dir)
-        self.profiles_dir = self.data_dir / "profiles"
+        self.profiles_dir = Path(profiles_dir) if profiles_dir else self.data_dir / "profiles"
         self.storage = StorageManager(db_path or str(self.data_dir / "profiles.db"))
 
     async def initialize(self) -> None:
