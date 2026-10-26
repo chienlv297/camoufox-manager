@@ -11,8 +11,12 @@ reliable window-close signal on its own.
 """
 
 import asyncio
+import json
 import os
-from collections.abc import Awaitable, Callable
+import sys
+import tempfile
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -21,6 +25,7 @@ import psutil
 from loguru import logger
 
 from ..config import get_settings
+from .socks_relay import SocksRelay
 
 if TYPE_CHECKING:
     # Type-only: importing StorageManager at runtime would be a cycle, since
@@ -134,6 +139,92 @@ def _maximize_and_focus_window(profile_path: str | None) -> None:
         logger.debug(f"Could not maximize/focus browser window: {exc}")
 
 
+def _browser_launch_options(launch_options: dict[str, Any]) -> dict[str, Any]:
+    """Keep Linux desktop input methods usable without changing the manager.
+
+    Playwright's focus test mode prevents native IME composition from committing
+    in headed Firefox. PyInstaller also prepends its bundled libraries to
+    LD_LIBRARY_PATH; those GTK/GLib versions can be incompatible with the host's
+    input-method module. Restore the pre-bundle path for the browser child only.
+    Explicit preferences and environments remain under the caller's control.
+    """
+    options = launch_options.copy()
+    if sys.platform != "linux":
+        return options
+
+    if not options.get("headless", False):
+        prefs = dict(options.get("firefox_user_prefs") or {})
+        prefs.setdefault("focusmanager.testmode", False)
+        options["firefox_user_prefs"] = prefs
+
+    if getattr(sys, "frozen", False) and options.get("env") is None:
+        env = os.environ.copy()
+        original_path = env.get("LD_LIBRARY_PATH_ORIG")
+        if original_path:
+            env["LD_LIBRARY_PATH"] = original_path
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+        options["env"] = env
+    return options
+
+
+def _replace_preferences(path: Path, content: bytes) -> None:
+    """Replace a small preferences file without leaving a partial write."""
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            handle.write(content)
+            handle.close()
+            if path.exists():
+                temporary.chmod(path.stat().st_mode)
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def _linux_ime_startup_preferences(options: dict[str, Any]) -> Iterator[None]:
+    """Apply focus preferences before GTK creates its input context.
+
+    Playwright 1.60 sends firefox_user_prefs over Browser.enable after startup.
+    That is too late for native IME focus: candidates appear but do not commit.
+    Temporarily append the preference to this profile's user.js so Firefox
+    reads it at startup, then restore the original file after launch or failure.
+    """
+    directory = options.get("user_data_dir")
+    if (
+        sys.platform != "linux"
+        or options.get("headless")
+        or not options.get("persistent_context")
+        or not directory
+    ):
+        yield
+        return
+
+    path = Path(directory) / "user.js"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = path.read_bytes() if path.exists() else None
+    preference = options["firefox_user_prefs"]["focusmanager.testmode"]
+    content = (original or b"") + (
+        f'\nuser_pref("focusmanager.testmode", {json.dumps(preference)});\n'
+    ).encode()
+    _replace_preferences(path, content)
+    try:
+        yield
+    finally:
+        try:
+            # Preserve a concurrent edit, or a preferences file rewritten by an
+            # older Playwright release, instead of silently overwriting it.
+            if path.exists() and path.read_bytes() == content:
+                if original is None:
+                    path.unlink()
+                else:
+                    _replace_preferences(path, original)
+        except OSError as exc:
+            # Cleanup must not orphan a browser which has already started.
+            logger.warning(f"Could not restore browser startup preferences: {exc}")
+
+
 def _resolve_process_id(obj: Any) -> int | None:
     """Best-effort resolution of a driver/browser OS process id.
 
@@ -157,6 +248,22 @@ def _resolve_process_id(obj: Any) -> int | None:
     return None
 
 
+async def _drain_cleanup(task: asyncio.Task) -> Any:
+    """Let owned teardown finish even when its request is cancelled repeatedly."""
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            cancelled = True
+    result = task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
 class BrowserSession:
     """A single running Camoufox browser tied to a profile."""
 
@@ -165,6 +272,7 @@ class BrowserSession:
         profile_id: str,
         camoufox: Any,
         process_id: int | None = None,
+        socks_relay: SocksRelay | None = None,
         browser: Any | None = None,
         profile_path: str | None = None,
     ):
@@ -172,29 +280,32 @@ class BrowserSession:
         self.camoufox = camoufox  # AsyncCamoufox context manager instance
         self.browser = browser
         self.process_id = process_id
-        self.profile_path = profile_path
         self.started_at = datetime.now()
         self.monitor_task: asyncio.Task | None = None
         self.on_exit: ExitHandler | None = None
+        self.on_stopped: ExitHandler | None = None
         self._terminated = False
+        self.socks_relay = socks_relay
+        self.profile_path = profile_path
+        self._termination_task: asyncio.Task[None] | None = None
 
     async def terminate(self) -> None:
-        """Close the browser and stop its monitor task. Safe to call twice."""
-        if self._terminated:
-            return
-        self._terminated = True
-        logger.info(f"Terminating browser session for profile {self.profile_id}")
+        """Drain one strongly owned teardown, including after caller cancellation."""
+        if self._termination_task is None:
+            self._termination_task = asyncio.create_task(self._terminate())
+        await _drain_cleanup(self._termination_task)
 
-        # The monitor can be the caller here (_monitor -> _handle_exit -> terminate),
-        # and a task cannot await itself; cancelling is enough in that case.
-        monitor = self.monitor_task
-        if monitor and not monitor.done():
-            monitor.cancel()
-            if asyncio.current_task() is not monitor:
-                try:
-                    await monitor
-                except asyncio.CancelledError:
-                    pass
+    async def _terminate(self) -> None:
+        logger.info(f"Terminating browser session for profile {self.profile_id}")
+        # Do not await the monitor: it may itself be waiting for this teardown.
+        if self.monitor_task and not self.monitor_task.done():
+            self.monitor_task.cancel()
+
+        if self.socks_relay is not None:
+            try:
+                await self.socks_relay.close()
+            except Exception as exc:
+                logger.warning(f"Error closing proxy relay for {self.profile_id}: {exc}")
 
         if self.camoufox is not None:
             try:
@@ -216,34 +327,40 @@ class BrowserSession:
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"Error killing process {self.process_id}: {exc}")
 
+        self._terminated = True
+
     async def open_urls(self, urls: list[str]) -> None:
-        """Open URLs, reusing the initial blank tab when one exists."""
+        """Open URLs in browser context, reusing its initial blank page."""
         if not urls:
             return
         if self.browser is None or not hasattr(self.browser, "new_page"):
-            raise BrowserLaunchError(f"Browser context for profile {self.profile_id} is unavailable")
+            raise BrowserLaunchError(
+                f"Browser context for profile {self.profile_id} is unavailable"
+            )
         pages = list(getattr(self.browser, "pages", []))
-        page = next((candidate for candidate in pages if candidate.url == "about:blank"), None)
+        blank_page = next((page for page in pages if page.url == "about:blank"), None)
         for index, url in enumerate(urls):
-            target = page if index == 0 and page is not None else await self.browser.new_page()
+            page = (
+                blank_page
+                if index == 0 and blank_page is not None
+                else await self.browser.new_page()
+            )
             try:
-                await target.goto(url, wait_until="commit")
+                await page.goto(url, wait_until="commit")
             except Exception:
-                if target not in pages:
+                if page not in pages:
                     try:
-                        await target.close()
+                        await page.close()
                     except Exception:
                         pass
                 raise
-            if index == 0:
-                page = target
         await self.activate()
 
     async def activate(self) -> None:
-        """Focus existing browser page and maximize its native window."""
+        """Bring the most useful page forward and maximize its native window."""
         if self.browser is not None:
             pages = list(getattr(self.browser, "pages", []))
-            page = next((candidate for candidate in reversed(pages) if candidate.url != "about:blank"), None)
+            page = next((item for item in reversed(pages) if item.url != "about:blank"), None)
             if page is None and pages:
                 page = pages[-1]
             if page is not None:
@@ -277,11 +394,14 @@ class BrowserSessionManager:
         # suspended inside camoufox.__aexit__ could be garbage-collected and take
         # the primary cleanup path with it. Hold a strong reference until done.
         self._exit_tasks: set[asyncio.Task[None]] = set()
+        self._closing: dict[str, asyncio.Task[bool]] = {}
+        self._release_after_close: set[str] = set()
         # Lease bookkeeping. Without a storage and a holder id (unit tests, and
         # anything that only watches processes) every lease call below is a
         # no-op and this class behaves exactly as it did before leases existed.
         self._storage = storage
         self._holder = holder
+        self.on_stopped: ExitHandler | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
 
     def start_heartbeat(self, interval: float = 30.0) -> None:
@@ -396,10 +516,38 @@ class BrowserSessionManager:
         # registered, is_live() says this profile is coming up, and nothing
         # may hand its lease away.
         self._starting[profile_id] = self._starting.get(profile_id, 0) + 1
+        relay: SocksRelay | None = None
+        camoufox = None
+        cookie_directory: Path | None = None
+        pending_cookies = None
         try:
             try:
-                camoufox = AsyncCamoufox(**launch_options)
-                browser = await camoufox.start()
+                options = _browser_launch_options(launch_options)
+                proxy = options.get("proxy") or {}
+                if proxy.get("server", "").startswith("socks5://") and (
+                    proxy.get("username") or proxy.get("password")
+                ):
+                    relay = SocksRelay(
+                        proxy["server"], proxy.get("username"), proxy.get("password")
+                    )
+                    await relay.start()
+                    options["proxy"] = relay.browser_proxy
+                    prefs = dict(options.get("firefox_user_prefs") or {})
+                    prefs["network.proxy.socks_remote_dns"] = True
+                    options["firefox_user_prefs"] = prefs
+                if options.get("persistent_context") and options.get("user_data_dir"):
+                    from .cookie_transfer import take_pending_cookies
+
+                    cookie_directory = Path(options["user_data_dir"])
+                    pending_cookies = take_pending_cookies(cookie_directory)
+                with _linux_ime_startup_preferences(options):
+                    camoufox = AsyncCamoufox(**options)
+                    browser = await camoufox.start()
+                    if pending_cookies is not None:
+                        from .cookie_transfer import apply_pending_cookies
+
+                        assert cookie_directory is not None
+                        await apply_pending_cookies(browser, pending_cookies, cookie_directory)
             except Exception as exc:  # noqa: BLE001
                 raise BrowserLaunchError(f"Failed to launch browser: {exc}") from exc
 
@@ -408,25 +556,45 @@ class BrowserSessionManager:
                 profile_id,
                 camoufox,
                 process_id,
-                browser,
-                profile_path=launch_options.get("user_data_dir"),
+                socks_relay=relay,
+                browser=browser,
+                profile_path=options.get("user_data_dir"),
             )
             session.on_exit = on_exit
+            session.on_stopped = self.on_stopped
             self.active_sessions[profile_id] = session
+        except (Exception, asyncio.CancelledError):
+            # Keep the starting marker until both browser and relay teardown
+            # finish. Cancelling the request must not release a live profile.
+            failed_session = BrowserSession(
+                profile_id, camoufox, _resolve_process_id(camoufox), socks_relay=relay
+            )
             try:
-                await session.open_urls(initial_urls or [])
-                if not initial_urls:
-                    await session.activate()
-            except Exception:
-                self.active_sessions.pop(profile_id, None)
-                await session.terminate()
-                raise
+                await failed_session.terminate()
+            finally:
+                if cookie_directory is not None and pending_cookies is not None:
+                    from .cookie_transfer import discard_pending_ack
+                    from .profile_operations import run_file_operation
+
+                    await run_file_operation(
+                        discard_pending_ack, cookie_directory, pending_cookies["nonce"]
+                    )
+            raise
         finally:
             remaining = self._starting.get(profile_id, 1) - 1
             if remaining > 0:
                 self._starting[profile_id] = remaining
             else:
                 self._starting.pop(profile_id, None)
+
+        try:
+            await session.open_urls(initial_urls or [])
+            if not initial_urls:
+                await session.activate()
+        except Exception:
+            self.active_sessions.pop(profile_id, None)
+            await session.terminate()
+            raise
 
         # Primary signal: the browser/context closing (e.g. the user closes the window).
         self._register_close_handler(browser, profile_id)
@@ -436,23 +604,6 @@ class BrowserSessionManager:
 
         logger.info(f"Browser launched for profile {profile_id} (pid={process_id})")
         return session
-
-    async def open_urls(self, profile_id: str, urls: list[str]) -> None:
-        """Open URLs in an active profile without starting another browser."""
-        session = self.active_sessions.get(profile_id)
-        if session is None:
-            raise BrowserLaunchError(f"Browser for profile {profile_id} is not running")
-        await session.open_urls(urls)
-
-    async def activate(self, profile_id: str) -> bool:
-        """Bring an existing profile window forward without opening another page."""
-        session = self.active_sessions.get(profile_id)
-        if session is None:
-            return False
-        activate = getattr(session, "activate", None)
-        if activate is not None:
-            await activate()
-        return True
 
     def _register_close_handler(self, browser: Any, profile_id: str) -> None:
         """Wire Playwright close/disconnect events to session cleanup."""
@@ -471,39 +622,51 @@ class BrowserSessionManager:
 
     async def _handle_exit(self, profile_id: str) -> None:
         """Tear down a session exactly once and notify the exit handler."""
-        session = self.active_sessions.pop(profile_id, None)
-        if session is None:
-            return
-        await session.terminate()
-        # The browser is gone, so the lease must not outlive it. release_lease
-        # is guarded on the holder id, so a lease already taken over by another
-        # instance is left exactly where it is.
-        await self._release_lease(profile_id)
-        if session.on_exit is not None:
-            try:
-                await session.on_exit(profile_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"on_exit handler failed for {profile_id}: {exc}")
+        await self._close_session(profile_id, release_lease=True, notify=True)
+
+    async def _close_session(
+        self, profile_id: str, *, release_lease: bool, notify: bool = False
+    ) -> bool:
+        task = self._closing.get(profile_id)
+        if release_lease:
+            self._release_after_close.add(profile_id)
+        if task is None:
+            session = self.active_sessions.get(profile_id)
+            if session is None:
+                self._release_after_close.discard(profile_id)
+                return False
+
+            async def finish() -> bool:
+                try:
+                    await session.terminate()
+                    stopped = getattr(session, "on_stopped", self.on_stopped)
+                    if stopped is not None:
+                        await stopped(profile_id)
+                    if profile_id in self._release_after_close:
+                        await self._release_lease(profile_id)
+                    if self.active_sessions.get(profile_id) is session:
+                        self.active_sessions.pop(profile_id)
+                    if notify and session.on_exit is not None:
+                        try:
+                            await session.on_exit(profile_id)
+                        except Exception as exc:
+                            logger.warning(f"on_exit handler failed for {profile_id}: {exc}")
+                    return True
+                finally:
+                    self._closing.pop(profile_id, None)
+                    self._release_after_close.discard(profile_id)
+
+            task = asyncio.create_task(finish())
+            self._closing[profile_id] = task
+        return await _drain_cleanup(task)
 
     async def close(self, profile_id: str) -> bool:
-        """Close a single browser. Returns ``False`` if it was not running."""
-        session = self.active_sessions.pop(profile_id, None)
-        if session is None:
-            return False
-        await session.terminate()
-        return True
+        """Close one browser, keeping it tracked until teardown completes."""
+        return await self._close_session(profile_id, release_lease=False)
 
     async def close_and_release(self, profile_id: str) -> bool:
-        """Close a browser and hand its lease back, if we still hold it.
-
-        Separate from :meth:`close` because one caller must not release: when
-        the heartbeat finds a lease gone, the browser still has to be closed,
-        and clearing the lease then would clear the *new* holder's.
-        """
-        closed = await self.close(profile_id)
-        if closed:
-            await self._release_lease(profile_id)
-        return closed
+        """Drain browser teardown, then release its lease in the same owned task."""
+        return await self._close_session(profile_id, release_lease=True)
 
     async def _release_lease(self, profile_id: str) -> None:
         """Best-effort lease release. Teardown must not fail on bookkeeping."""

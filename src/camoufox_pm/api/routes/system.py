@@ -2,16 +2,18 @@
 
 import time
 from pathlib import Path
+from typing import Literal
 
 import psutil
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
+from pydantic import BaseModel, ConfigDict
 
 from camoufox_pm import __version__
+from camoufox_pm.api.access import require_admin
 from camoufox_pm.api.dependencies import get_profile_manager, get_storage_manager
 from camoufox_pm.api.models.system import (
     ApiResponse,
-    BrowserStatusData,
     DevicePreset,
     PresetListData,
     ProfileCleanupResponse,
@@ -20,13 +22,12 @@ from camoufox_pm.api.models.system import (
     SystemInfoData,
     SystemStatusResponse,
 )
-from camoufox_pm.browser_runtime import BrowserRuntimeManager
 from camoufox_pm.config import get_settings
 from camoufox_pm.core import fingerprint_store
-from camoufox_pm.core.browser_session import CAMOUFOX_AVAILABLE
+from camoufox_pm.core.browser_install import installed_browser
 from camoufox_pm.core.cleanup import ProfileCleanupManager
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_admin)])
 
 # Application startup time, used to compute uptime.
 startup_time = time.time()
@@ -41,43 +42,8 @@ def _cleanup_manager() -> ProfileCleanupManager:
     concluded that every profile directory on disk was an orphan, and deleted
     them all.
     """
-    settings = get_settings()
-    return ProfileCleanupManager(
-        str(Path(settings.db_path).parent),
-        settings.db_path,
-        profiles_dir=settings.effective_profiles_dir,
-    )
-
-
-def _browser_runtime() -> BrowserRuntimeManager:
-    from camoufox_pm.main import browser_runtime
-
-    return browser_runtime
-
-
-@router.get(
-    "/system/browser",
-    response_model=BrowserStatusData,
-    operation_id="get_browser_status",
-    summary="Report Camoufox browser installation status.",
-)
-async def get_browser_status():
-    return BrowserStatusData(**_browser_runtime().snapshot())
-
-
-@router.post(
-    "/system/browser/retry",
-    response_model=BrowserStatusData,
-    operation_id="retry_browser_download",
-    summary="Retry Camoufox browser installation.",
-)
-async def retry_browser_download(request: Request):
-    origin = request.headers.get("origin")
-    if request.headers.get("sec-fetch-site") == "cross-site" or (
-        origin and origin.rstrip("/") != str(request.base_url).rstrip("/")
-    ):
-        raise HTTPException(status_code=403, detail="Cross-origin browser installation is blocked")
-    return BrowserStatusData(**await _browser_runtime().retry())
+    db_path = Path(get_settings().db_path)
+    return ProfileCleanupManager(str(db_path.parent), str(db_path))
 
 
 @router.get(
@@ -255,9 +221,7 @@ async def get_system_config():
             user_auth_enabled=await get_storage_manager().count_users() > 0,
             encryption_enabled=bool(settings.secret_key),
             cors_origins=settings.cors_origins,
-            camoufox_available=CAMOUFOX_AVAILABLE,
-            browser_status=_browser_runtime().snapshot()["status"],
-            browser_path=_browser_runtime().snapshot()["path"],
+            camoufox_available=installed_browser()[0],
             uptime_seconds=int(time.time() - startup_time),
         ),
     )
@@ -282,3 +246,72 @@ async def get_system_info():
             uptime_seconds=int(time.time() - startup_time),
         ),
     )
+
+
+@router.get("/system/update-recovery", operation_id="update_recovery_status")
+async def update_recovery_status():
+    """Expose transaction progress without credential-bearing local paths."""
+    from camoufox_pm.core.update_runtime import status
+
+    try:
+        return status()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.post("/system/update-recovery/cancel", operation_id="cancel_update_preparation")
+async def cancel_update_preparation():
+    """Resume normal operation only before any executable replacement."""
+    from camoufox_pm.core.update_runtime import cancel
+
+    try:
+        return cancel()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+class UpdateDownloadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    channel: Literal["stable", "preview"] = "stable"
+
+
+class UpdateActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    transaction_id: str
+    confirm_timestamp: str | None = None
+
+
+@router.post("/system/update-recovery/download", operation_id="download_verified_update")
+async def download_verified_update(body: UpdateDownloadRequest):
+    import asyncio
+
+    from camoufox_pm.core.update_runtime import download
+
+    try:
+        return await asyncio.to_thread(download, body.channel)
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise HTTPException(status_code=409, detail="Verified update download unavailable") from exc
+
+
+async def _request_update_action(action, body):
+    from camoufox_pm.core.update_runtime import request
+
+    try:
+        return request(action, body.transaction_id, body.confirm_timestamp)
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/system/update-recovery/apply", operation_id="apply_verified_update")
+async def apply_verified_update(body: UpdateActionRequest):
+    return await _request_update_action("apply", body)
+
+
+@router.post("/system/update-recovery/resume", operation_id="resume_verified_update")
+async def resume_verified_update(body: UpdateActionRequest):
+    return await _request_update_action("resume", body)
+
+
+@router.post("/system/update-recovery/rollback", operation_id="rollback_verified_update")
+async def rollback_verified_update(body: UpdateActionRequest):
+    return await _request_update_action("rollback", body)

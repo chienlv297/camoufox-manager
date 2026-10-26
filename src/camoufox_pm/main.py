@@ -1,6 +1,7 @@
 """Camoufox Profile Manager REST API."""
 
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 from fastapi import Depends, FastAPI
@@ -17,31 +18,36 @@ from camoufox_pm.api.dependencies import (
     set_storage_manager,
 )
 from camoufox_pm.api.errors import install_error_handlers
+from camoufox_pm.api.middleware.access import AccessMiddleware
 from camoufox_pm.api.middleware.logging import LoggingMiddleware
+from camoufox_pm.api.middleware.maintenance import MaintenanceMiddleware
 from camoufox_pm.api.models.system import ErrorResponse, HealthResponse
-from camoufox_pm.api.routes import auth, groups, profiles, schedules, system
-from camoufox_pm.browser_runtime import BrowserRuntimeManager, configure_camoufox_runtime
+from camoufox_pm.api.routes import (
+    access,
+    auth,
+    cookies,
+    extensions,
+    groups,
+    profiles,
+    proxies,
+    recovery,
+    runtime,
+    saved_filters,
+    schedules,
+    sync,
+    system,
+    templates,
+)
 from camoufox_pm.config import get_settings
+from camoufox_pm.core.backups import ProfileBackupManager
 from camoufox_pm.core.database import StorageManager
+from camoufox_pm.core.maintenance import MaintenanceBlocked, MaintenanceGate
 from camoufox_pm.core.profile_manager import ProfileManager
 from camoufox_pm.core.scheduler import TaskScheduler
-from camoufox_pm.paths import (
-    bundled_browser_dir,
-    configure_logging,
-    ensure_runtime_dirs,
-    is_windows_standalone,
-    migrate_legacy_data,
-    runtime_paths,
-)
 
 settings = get_settings()
-paths = runtime_paths()
-if is_windows_standalone():
-    paths = ensure_runtime_dirs(paths)
-configure_camoufox_runtime(Path(settings.browser_dir))
-browser_runtime = BrowserRuntimeManager(
-    settings.browser_dir,
-    bundled_browser_dir() if is_windows_standalone() else None,
+maintenance_gate = MaintenanceGate(
+    Path(settings.db_path).parent / "update-control" / "maintenance.sqlite3"
 )
 
 
@@ -50,54 +56,92 @@ async def lifespan(app: FastAPI):
     """Initialize shared resources on startup and clean up on shutdown."""
     logger.info("Starting Camoufox Profile Manager API...")
 
-    if is_windows_standalone():
-        migrate_legacy_data(paths)
-        configure_logging(paths)
-    await browser_runtime.initialize(install_if_missing=is_windows_standalone())
-
+    if maintenance_gate.blocked:
+        raise MaintenanceBlocked(
+            "An interrupted update requires recovery before opening application data"
+        )
     storage_manager = StorageManager(settings.db_path)
-    await storage_manager.initialize()
-
-    profile_manager = ProfileManager(
-        storage_manager,
-        str(Path(settings.effective_profiles_dir).parent),
-        browser_runtime=browser_runtime,
-        profiles_dir=settings.effective_profiles_dir,
-    )
-    await profile_manager.initialize()
-
-    set_storage_manager(storage_manager)
-    set_profile_manager(profile_manager)
-
-    # In-process on purpose: the app owns the browser sessions, so scheduled
-    # launches must run where the sessions live, through the same manager.
-    scheduler = TaskScheduler(storage_manager, profile_manager)
-    await scheduler.start()
-    set_scheduler(scheduler)
-
-    logger.info("API ready")
+    profile_manager = None
+    scheduler = None
+    backup_task = None
+    sync_task = None
     try:
+        with maintenance_gate.operation():
+            maintenance_gate.register_manager()
+            await storage_manager.initialize()
+            data_dir = str(Path(settings.db_path).parent)
+            profile_manager = ProfileManager(storage_manager, data_dir)
+            await profile_manager.initialize()
+            set_storage_manager(storage_manager)
+            set_profile_manager(profile_manager)
+            sync.set_sync_directory(
+                Path(settings.db_path).expanduser().resolve().parent / "sync-control"
+            )
+
+            def sync_runtime():
+                from camoufox_pm.sync.runtime import SyncRuntime
+
+                return SyncRuntime(profile_manager, maintenance_gate)
+
+            sync.set_sync_runtime_factory(sync_runtime)
+
+            backup_manager = ProfileBackupManager(
+                profile_manager,
+                retention=settings.backup_retention,
+                interval_hours=settings.backup_interval_hours,
+            )
+            recovery.set_backup_manager(backup_manager)
+
+            async def back_up_idle_profiles():
+                while True:
+                    try:
+                        with maintenance_gate.operation():
+                            await backup_manager.create_due_backups()
+                    except Exception as exc:
+                        logger.warning(f"Automatic profile backup failed: {exc}")
+                    await asyncio.sleep(60)
+
+            scheduler = TaskScheduler(storage_manager, profile_manager)
+            scheduler.maintenance_gate = maintenance_gate
+            await scheduler.start()
+            set_scheduler(scheduler)
+            backup_task = asyncio.create_task(back_up_idle_profiles(), name="profile-backups")
+            from camoufox_pm.core.sync_background import sync_queue_worker
+
+            sync_task = asyncio.create_task(
+                sync_queue_worker(profile_manager, maintenance_gate), name="profile-sync"
+            )
+        logger.info("API ready")
         yield
     finally:
+        # This also runs when startup fails, so a failed desktop launch leaves
+        # neither a heartbeat nor a recovery task holding the database open.
         logger.info("Shutting down API...")
-        await scheduler.stop()
-        # Order matters. The heartbeat renews by holder id, so a beat racing the
-        # releases below would read our own cleared lease as a takeover and close
-        # a live browser: stop renewing first.
-        await profile_manager.browser_sessions.stop_heartbeat()
-        # Then close the browsers, which releases their leases as part of the
-        # close. release_all_leases deliberately skips profiles that are still
-        # live, so leaving them open here would leak every lease we hold.
         try:
-            await profile_manager.browser_sessions.close_all()
-        except Exception as exc:  # noqa: BLE001 - shutdown must not raise
-            logger.warning(f"Failed to close browsers on shutdown: {exc}")
-        # Finally hand back whatever is left. A lease must not outlive the
-        # process that took it, or a restart locks this instance out of its own
-        # profiles for a full TTL.
-        await profile_manager.release_all_leases()
-        await storage_manager.close()
-        await browser_runtime.shutdown()
+            if sync_task is not None:
+                sync_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await sync_task
+            if backup_task is not None:
+                backup_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await backup_task
+            if scheduler is not None:
+                await scheduler.stop()
+            if profile_manager is not None:
+                # Stop renewal before releasing any of this instance's leases.
+                await profile_manager.browser_sessions.stop_heartbeat()
+                try:
+                    await profile_manager.browser_sessions.close_all()
+                except Exception as exc:
+                    logger.warning(f"Failed to close browsers on shutdown: {exc}")
+                await profile_manager.release_all_leases()
+        finally:
+            sync.set_sync_runtime_factory(None)
+            sync.set_sync_directory(None)
+            recovery.set_backup_manager(None)
+            await storage_manager.close()
+            maintenance_gate.unregister_manager()
 
 
 app = FastAPI(
@@ -128,6 +172,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(LoggingMiddleware)
+app.add_middleware(AccessMiddleware)
+app.add_middleware(MaintenanceMiddleware, gate=maintenance_gate)
 
 # Session-or-API-key guard; a no-op when neither users nor CPM_API_KEY exist.
 protected = [Depends(require_auth)]
@@ -141,6 +187,20 @@ for _prefix, _in_schema in (("/api/v1", True), ("/api", False)):
         auth.router,
         prefix=_prefix,
         tags=["Auth"],
+        include_in_schema=_in_schema,
+    )
+    app.include_router(
+        sync.router,
+        prefix=_prefix,
+        tags=["Sync"],
+        dependencies=protected,
+        include_in_schema=_in_schema,
+    )
+    app.include_router(
+        access.router,
+        prefix=_prefix,
+        tags=["Access"],
+        dependencies=protected,
         include_in_schema=_in_schema,
     )
     app.include_router(
@@ -171,6 +231,27 @@ for _prefix, _in_schema in (("/api/v1", True), ("/api", False)):
         dependencies=protected,
         include_in_schema=_in_schema,
     )
+    for _router in (recovery.router, runtime.router, proxies.router):
+        app.include_router(
+            _router,
+            prefix=_prefix,
+            tags=["System"],
+            dependencies=protected,
+            include_in_schema=_in_schema,
+        )
+    for _router, _tag in (
+        (cookies.router, "Cookies"),
+        (extensions.router, "Extensions"),
+        (templates.router, "Templates"),
+        (saved_filters.router, "Saved views"),
+    ):
+        app.include_router(
+            _router,
+            prefix=_prefix,
+            tags=[_tag],
+            dependencies=protected,
+            include_in_schema=_in_schema,
+        )
 
 
 @app.get(
@@ -191,7 +272,9 @@ async def health_check():
             status="healthy",
             api_version=__version__,
             database="connected",
-            profiles_count=len(profiles_list),
+            profiles_count=None
+            if await profile_mgr.storage.count_users() or get_settings().api_key
+            else len(profiles_list),
         )
     except Exception:
         # 503 rather than a healthy-looking 200, so load balancers and container
@@ -248,5 +331,4 @@ if __name__ == "__main__":
         port=settings.port,
         reload=True,
         log_level="info",
-        log_config=None,
     )

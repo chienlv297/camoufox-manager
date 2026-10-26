@@ -47,6 +47,9 @@ async def test_state_a_nothing_configured_stays_open(client):
         "user_auth_enabled": False,
         "authenticated": True,
         "username": None,
+        "role": "administrator",
+        "actor_kind": "anonymous_local",
+        "can_manage_access": True,
     }
 
 
@@ -72,6 +75,9 @@ async def test_state_b_api_key_alone_behaves_exactly_as_before(client, monkeypat
         "user_auth_enabled": False,
         "authenticated": True,
         "username": None,
+        "role": "administrator",
+        "actor_kind": "legacy_api_key",
+        "can_manage_access": True,
     }
 
 
@@ -102,6 +108,9 @@ async def test_api_key_authenticates_session_probe_with_users(client, monkeypatc
         "user_auth_enabled": True,
         "authenticated": True,
         "username": None,
+        "role": "administrator",
+        "actor_kind": "legacy_api_key",
+        "can_manage_access": True,
     }
 
 
@@ -116,6 +125,9 @@ async def test_login_grants_a_session_that_passes_the_guard(client):
         "user_auth_enabled": True,
         "authenticated": True,
         "username": "alice",
+        "role": "administrator",
+        "actor_kind": "session",
+        "can_manage_access": True,
     }
 
     set_cookie = login.headers["set-cookie"]

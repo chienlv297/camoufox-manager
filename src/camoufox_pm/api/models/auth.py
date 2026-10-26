@@ -20,3 +20,7 @@ class AuthSessionResponse(BaseModel):
         ..., description="Whether this request may access protected API routes"
     )
     username: str | None = Field(None, description="The logged-in user, when authenticated")
+
+    role: str | None = None
+    actor_kind: str | None = None
+    can_manage_access: bool = False

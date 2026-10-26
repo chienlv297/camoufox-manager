@@ -1,5 +1,8 @@
 'use client'
 
+import { LanguageSelector } from '@/components/language-selector'
+import { useI18n } from '@/components/i18n-provider'
+
 import { createContext, useCallback, useContext, useEffect, useState } from 'react'
 
 import { authAPI, setApiKey, type AuthSession } from '@/lib/api'
@@ -7,10 +10,12 @@ import { authAPI, setApiKey, type AuthSession } from '@/lib/api'
 interface AuthState {
   /** The logged-in user, or null when login is off or not yet established. */
   username: string | null
+  role: 'administrator' | 'operator' | 'viewer' | null
+  canManageAccess: boolean
   logout: () => Promise<void>
 }
 
-const AuthContext = createContext<AuthState>({ username: null, logout: async () => {} })
+const AuthContext = createContext<AuthState>({ username: null, role: null, canManageAccess: false, logout: async () => {} })
 
 export function useAuth(): AuthState {
   return useContext(AuthContext)
@@ -74,7 +79,7 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
   if (probeFailed) return <SessionUnavailable onRetry={refresh} />
 
   return (
-    <AuthContext.Provider value={{ username: session?.username ?? null, logout }}>
+    <AuthContext.Provider value={{ username: session?.username ?? null, role: session?.role ?? null, canManageAccess: session?.can_manage_access === true, logout }}>
       {children}
     </AuthContext.Provider>
   )
@@ -132,13 +137,13 @@ function ApiKeyScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSess
 }
 
 function SessionUnavailable({ onRetry }: { onRetry: () => Promise<void> }) {
+  const { t } = useI18n()
   return (
-    <div className="flex h-screen items-center justify-center">
+    <div className="flex h-screen items-center justify-center" role="alert">
       <div className="panel flex w-[300px] flex-col gap-3 p-5">
-        <h1 className="text-[14px] font-semibold">Server unavailable</h1>
-        <p className="text-ink-dim">Could not verify access. Check the server and try again.</p>
+        <p className="text-ink-dim">{t('Unable to verify access')}</p>
         <button type="button" className="btn btn-primary" onClick={() => void onRetry()}>
-          Retry
+          {t('Retry')}
         </button>
       </div>
     </div>
@@ -146,6 +151,7 @@ function SessionUnavailable({ onRetry }: { onRetry: () => Promise<void> }) {
 }
 
 function LoginScreen({ onLoggedIn }: { onLoggedIn: (session: AuthSession) => void }) {
+  const { t } = useI18n()
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -168,9 +174,10 @@ function LoginScreen({ onLoggedIn }: { onLoggedIn: (session: AuthSession) => voi
   return (
     <div className="flex h-screen items-center justify-center">
       <form onSubmit={submit} className="panel flex w-[300px] flex-col gap-3 p-5">
-        <h1 className="text-[14px] font-semibold">Sign in</h1>
+        <LanguageSelector />
+        <h1 className="text-[14px] font-semibold">{t('Sign in')}</h1>
         <label className="flex flex-col gap-1">
-          <span className="text-ink-dim">Username</span>
+          <span className="text-ink-dim">{t('Username')}</span>
           <input
             className="field"
             value={username}
@@ -180,7 +187,7 @@ function LoginScreen({ onLoggedIn }: { onLoggedIn: (session: AuthSession) => voi
           />
         </label>
         <label className="flex flex-col gap-1">
-          <span className="text-ink-dim">Password</span>
+          <span className="text-ink-dim">{t('Password')}</span>
           <input
             type="password"
             className="field"
@@ -191,7 +198,7 @@ function LoginScreen({ onLoggedIn }: { onLoggedIn: (session: AuthSession) => voi
         </label>
         {error && <p className="text-danger">{error}</p>}
         <button type="submit" className="btn btn-primary" disabled={busy || !username || !password}>
-          {busy ? 'Signing in…' : 'Sign in'}
+          {busy ? t('Signing in…') : t('Sign in')}
         </button>
       </form>
     </div>

@@ -17,13 +17,28 @@ import {
   Search,
   Square,
   Trash2,
+  Tags,
+  Cookie,
+  Puzzle,
+  Bookmark,
   Upload,
   Users,
 } from 'lucide-react'
 
+import { useI18n } from '@/components/i18n-provider'
+import { useAuth } from '@/components/login-gate'
+import { ProfileSyncPanel, syncPhaseLabel } from '@/components/profile-sync-panel'
+import { profileSyncAPI, type ProfileSyncBinding } from '@/lib/sync-api'
+import { BrowserSetup } from '@/components/browser-setup'
 import { EmptyState } from '@/components/empty-state'
 import { ConfirmDialog, Modal } from '@/components/modal'
 import { ProfileForm } from '@/components/profile-form'
+import { CookieTransfer } from '@/components/cookie-transfer'
+import { ProfileExtensionsModal } from '@/components/profile-extensions-modal'
+import { TemplateFromProfileModal } from '@/components/template-from-profile-modal'
+import { ProfileTagsDialog } from '@/components/profile-tags-dialog'
+import { SavedProfileViews } from '@/components/saved-profile-views'
+import { DEFAULT_VIEW, profileViewQuery, readProfileView } from '@/lib/profile-views'
 import { useToast } from '@/components/toast'
 import {
   browsersAPI,
@@ -36,6 +51,7 @@ import {
   readProxyCheck,
   type Group,
   type Profile,
+  type ProfileViewConfig,
   type ProxyCheckRecord,
 } from '@/lib/api'
 
@@ -51,6 +67,11 @@ const COLUMNS: { key: SortKey; label: string; className?: string }[] = [
 ]
 
 export default function ProfilesPage() {
+  const { t, locale } = useI18n()
+  const { canManageAccess, role } = useAuth()
+  const can = (profile: Profile, permission: 'view' | 'edit' | 'launch' | 'export') => canManageAccess || profile.permissions?.[permission] === true
+  const [syncFor, setSyncFor] = useState<Profile | 'available' | null>(null)
+  const [syncBindings, setSyncBindings] = useState<ProfileSyncBinding[]>([])
   const [profiles, setProfiles] = useState<Profile[]>([])
   const [groups, setGroups] = useState<Group[]>([])
   const [running, setRunning] = useState<Set<string>>(new Set())
@@ -59,7 +80,10 @@ export default function ProfilesPage() {
   const [error, setError] = useState<string | null>(null)
 
   const [search, setSearch] = useState('')
-  const [statusFilter, setStatusFilter] = useState('all')
+  const [statusFilter, setStatusFilter] = useState<ProfileViewConfig['status']>('all')
+  const [groupFilter, setGroupFilter] = useState<string | null>(null)
+  const [tagFilters, setTagFilters] = useState<string[]>([])
+  const [urlReady, setUrlReady] = useState(false)
   const [sortKey, setSortKey] = useState<SortKey>('name')
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc')
   const [page, setPage] = useState(1)
@@ -77,6 +101,10 @@ export default function ProfilesPage() {
     run: () => Promise<void>
   }>(null)
   const [exportOpen, setExportOpen] = useState(false)
+  const [cookiesFor, setCookiesFor] = useState<Profile | null>(null)
+  const [extensionsFor, setExtensionsFor] = useState<Profile | null>(null)
+  const [templateFor, setTemplateFor] = useState<Profile | null>(null)
+  const [tagsFor, setTagsFor] = useState<Profile[] | null>(null)
 
   const toast = useToast()
   const importRef = useRef<HTMLInputElement>(null)
@@ -92,14 +120,23 @@ export default function ProfilesPage() {
         const response = await profilesAPI.getProfiles({ page: pageNumber, per_page: 100 })
         collected.push(...response.profiles)
         if (!response.has_next) break
+        if (pageNumber === 200) throw new Error('The profile collection is too large to load completely. No partial filter results are shown.')
       }
       setProfiles(collected)
+      if (canManageAccess) {
+        try { const result = await profileSyncAPI.list(); if (!Array.isArray(result.profiles)) throw new Error('Invalid sync status'); setSyncBindings(result.profiles) }
+        catch { setSyncBindings(current => current.map(binding => ({ ...binding, phase: 'unknown' }))) }
+      }
     } catch (err) {
+      setProfiles([])
+      setSelected(new Set())
+      setEditing(null)
+      setFormOpen(false)
       setError(String(err instanceof Error ? err.message : err))
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [canManageAccess])
 
   const loadRunning = useCallback(async () => {
     try {
@@ -149,11 +186,28 @@ export default function ProfilesPage() {
   // rather than in an effect: an effect would paint the new results clamped to
   // whatever page number survived, then snap to the first one, and React
   // documents this as the way to derive state from a change in props or state.
-  const [filterForPage, setFilterForPage] = useState(() => ({ search, statusFilter }))
-  if (filterForPage.search !== search || filterForPage.statusFilter !== statusFilter) {
-    setFilterForPage({ search, statusFilter })
+  const [filterForPage, setFilterForPage] = useState(() => ({ search, statusFilter, groupFilter, tagFilters: tagFilters.join('\0') }))
+  if (filterForPage.search !== search || filterForPage.statusFilter !== statusFilter || filterForPage.groupFilter !== groupFilter || filterForPage.tagFilters !== tagFilters.join('\0')) {
+    setFilterForPage({ search, statusFilter, groupFilter, tagFilters: tagFilters.join('\0') })
     setPage(1)
+    setSelected(new Set())
   }
+
+  const viewConfig = useMemo<ProfileViewConfig>(() => ({ search, status: statusFilter, group: groupFilter, tags: tagFilters, sort_key: sortKey, sort_direction: sortDir }), [search, statusFilter, groupFilter, tagFilters, sortKey, sortDir])
+  function applyView(config: ProfileViewConfig, targetPage = 1) {
+    setSearch(config.search); setStatusFilter(config.status); setGroupFilter(config.group); setTagFilters(config.tags)
+    setSortKey(config.sort_key); setSortDir(config.sort_direction); setPage(targetPage); setSelected(new Set())
+    setFilterForPage({ search: config.search, statusFilter: config.status, groupFilter: config.group, tagFilters: config.tags.join('\0') })
+  }
+
+  useEffect(() => {
+    const read = () => { const view = readProfileView(new URLSearchParams(window.location.search)); applyView(view.config, view.page); setUrlReady(true) }
+    // Read only after mount: the bundled static page has no request URL.
+    read()
+    window.addEventListener('popstate', read)
+    return () => window.removeEventListener('popstate', read)
+  }, [])
+
 
   const groupNames = useMemo(
     () => new Map(groups.map((group) => [group.id, group.name])),
@@ -164,6 +218,9 @@ export default function ProfilesPage() {
     const needle = search.trim().toLowerCase()
     const filtered = profiles.filter((profile) => {
       if (statusFilter !== 'all' && profile.status !== statusFilter) return false
+      if (groupFilter === '__ungrouped__' && profile.group) return false
+      if (groupFilter && groupFilter !== '__ungrouped__' && profile.group !== groupFilter) return false
+      if (!tagFilters.every(tag => (profile.tags ?? []).includes(tag))) return false
       if (!needle) return true
       return (
         profile.name.toLowerCase().includes(needle) || profile.id.toLowerCase().includes(needle)
@@ -191,7 +248,7 @@ export default function ProfilesPage() {
           return a.name.localeCompare(b.name) * direction
       }
     })
-  }, [profiles, search, statusFilter, sortKey, sortDir, groupNames])
+  }, [profiles, search, statusFilter, groupFilter, tagFilters, sortKey, sortDir, groupNames])
 
   // Offering the bulk clear when nothing selected would change is just noise.
   const selectedWithGeography = useMemo(
@@ -209,6 +266,13 @@ export default function ProfilesPage() {
   // Deleting the last rows of a page must not strand the user on an empty one.
   const currentPage = Math.min(page, totalPages)
   const pageRows = visible.slice((currentPage - 1) * perPage, currentPage * perPage)
+  const availableTags = [...new Set(profiles.flatMap(profile => profile.tags ?? []))].sort()
+  useEffect(() => {
+    if (!urlReady || loading) return
+    const query = profileViewQuery(viewConfig, currentPage, new URLSearchParams(window.location.search))
+    const target = `${window.location.pathname}${query ? `?${query}` : ''}${window.location.hash}`
+    window.history.replaceState(null, '', target)
+  }, [viewConfig, currentPage, urlReady, loading])
   const allOnPageSelected = pageRows.length > 0 && pageRows.every((row) => selected.has(row.id))
 
   /** Close the row menu and hand focus back to the button that opened it.
@@ -248,7 +312,7 @@ export default function ProfilesPage() {
         await profilesAPI.startProfile(profile.id)
         await Promise.all([loadRunning(), loadProfiles()])
       } catch (err) {
-        toast('error', 'Could not launch browser', String(err))
+        toast('error', t('Could not launch browser'), String(err))
       }
     })
   }
@@ -259,7 +323,7 @@ export default function ProfilesPage() {
         await profilesAPI.closeProfile(profile.id)
         await loadRunning()
       } catch (err) {
-        toast('error', 'Could not close browser', String(err))
+        toast('error', t('Could not close browser'), String(err))
       }
     })
   }
@@ -276,18 +340,18 @@ export default function ProfilesPage() {
   }
 
   async function exportArchive(profile: Profile) {
-    toast('info', 'Packing the profile…', 'Cookies and history make this take a moment.')
+    toast('info', t('Packing the profile…'), t('Cookies and history make this take a moment.'))
     try {
       const blob = await profilesAPI.exportArchive(profile.id)
       const safe = profile.name.replace(/[^A-Za-z0-9_.-]+/g, '-').replace(/^-|-$/g, '')
       download(blob, `${safe || profile.id}.camoufox.zip`)
       toast(
         'ok',
-        'Profile exported',
-        'The archive holds session cookies and the proxy password — keep it like a password.',
+        t('Profile exported'),
+        t('The archive holds session cookies and the proxy password — keep it like a password.'),
       )
     } catch (err) {
-      toast('error', 'Could not export the profile', String(err))
+      toast('error', t('Could not export the profile'), String(err))
     }
   }
 
@@ -297,20 +361,20 @@ export default function ProfilesPage() {
     if (!file) return
     try {
       const profile = await profilesAPI.importArchive(file)
-      toast('ok', 'Profile imported', profile.name)
+      toast('ok', t('Profile imported'), profile.name)
       loadProfiles()
     } catch (err) {
-      toast('error', 'Could not import the profile', String(err))
+      toast('error', t('Could not import the profile'), String(err))
     }
   }
 
   async function clone(profile: Profile) {
     try {
-      await profilesAPI.cloneProfile(profile.id, `${profile.name} copy`)
-      toast('ok', 'Profile cloned', `${profile.name} copy`)
+      await profilesAPI.cloneProfile(profile.id, t('{name} copy', { name: profile.name }))
+      toast('ok', t('Profile cloned'), t('{name} copy', { name: profile.name }))
       loadProfiles()
     } catch (err) {
-      toast('error', 'Could not clone profile', String(err))
+      toast('error', t('Could not clone profile'), String(err))
     }
   }
 
@@ -341,7 +405,7 @@ export default function ProfilesPage() {
       )
       return record
     } catch (err) {
-      toast('error', 'Could not check the proxy', String(err))
+      toast('error', t('Could not check the proxy'), String(err))
       return null
     } finally {
       setCheckingProxies((current) => {
@@ -384,23 +448,23 @@ export default function ProfilesPage() {
     // Worded from the same rule the dots use, so a red row is never counted as
     // an answer just because the proxy replied.
     const parts = [
-      flagged ? `${flagged} need attention` : null,
-      unchecked ? `${unchecked} could not be checked` : null,
+      flagged ? t('{count} need attention', { count: flagged }) : null,
+      unchecked ? t('{count} could not be checked', { count: unchecked }) : null,
     ].filter(Boolean)
 
     if (parts.length)
-      toast('error', parts.join(', '), `of ${total} selected. The rows carry the detail.`)
-    else toast('ok', `${clean} ${clean === 1 ? 'proxy is' : 'proxies are'} healthy`)
+      toast('error', parts.join(', '), t('of {count} selected. The rows carry the detail.', { count: total }))
+    else toast('ok', clean === 1 ? t('1 proxy is healthy') : t('{count} proxies are healthy', { count: clean }))
   }
 
   function askDelete(profile: Profile) {
     setConfirm({
-      title: 'Delete profile',
-      body: `"${profile.name}" and its browser data will be removed. This cannot be undone.`,
-      label: 'Delete',
+      title: t('Move profile to Trash'),
+      body: t('"{name}" and its browser data will move to Trash. You can restore them from the sidebar.', { name: profile.name }),
+      label: t('Move to Trash'),
       run: async () => {
         await profilesAPI.deleteProfile(profile.id)
-        toast('ok', 'Profile deleted', profile.name)
+        toast('ok', t('Profile moved to Trash'), profile.name)
         setSelected((current) => {
           const next = new Set(current)
           next.delete(profile.id)
@@ -414,12 +478,12 @@ export default function ProfilesPage() {
   function askBulkDelete() {
     const count = selected.size
     setConfirm({
-      title: `Delete ${count} profile${count === 1 ? '' : 's'}`,
-      body: 'The selected profiles and their browser data will be removed. This cannot be undone.',
-      label: 'Delete',
+      title: count === 1 ? t('Move 1 profile to Trash') : t('Move {count} profiles to Trash', { count }),
+      body: t('The selected profiles and their browser data will move to Trash. You can restore them from the sidebar.'),
+      label: t('Move to Trash'),
       run: async () => {
         for (const id of selected) await profilesAPI.deleteProfile(id)
-        toast('ok', `Deleted ${count} profile${count === 1 ? '' : 's'}`)
+        toast('ok', count === 1 ? t('Moved 1 profile to Trash') : t('Moved {count} profiles to Trash', { count }))
         setSelected(new Set())
         loadProfiles()
       },
@@ -435,15 +499,13 @@ export default function ProfilesPage() {
   function askClearGeography() {
     const ids = profiles.filter((p) => selected.has(p.id) && hasGeography(p)).map((p) => p.id)
     setConfirm({
-      title: `Clear geography of ${ids.length} profile${ids.length === 1 ? '' : 's'}`,
+      title: ids.length === 1 ? t('Clear geography of 1 profile') : t('Clear geography of {count} profiles', { count: ids.length }),
       body:
-        'The stored timezone and coordinates are unset, so Camoufox derives both — and the ' +
-        'WebRTC address — from where each profile\'s proxy comes out, as a profile created ' +
-        'today does. Languages and the pinned machine are untouched.',
-      label: 'Clear',
+        t("The stored timezone and coordinates are unset, so Camoufox derives both — and the WebRTC address — from where each profile's proxy comes out, as a profile created today does. Languages and the pinned machine are untouched."),
+      label: t('Clear'),
       run: async () => {
         const result = await profilesAPI.clearGeography(ids)
-        toast('ok', `Cleared ${result.cleared.length} profile${result.cleared.length === 1 ? '' : 's'}`)
+        toast('ok', result.cleared.length === 1 ? t('Cleared 1 profile') : t('Cleared {count} profiles', { count: result.cleared.length }))
         setSelected(new Set())
         loadProfiles()
       },
@@ -452,9 +514,9 @@ export default function ProfilesPage() {
 
   function askCloseAll() {
     setConfirm({
-      title: 'Close all browsers',
-      body: `${running.size} running browser${running.size === 1 ? '' : 's'} will be closed.`,
-      label: 'Close all',
+      title: t('Close all browsers'),
+      body: running.size === 1 ? t('1 running browser will be closed.') : t('{count} running browsers will be closed.', { count: running.size }),
+      label: t('Close all'),
       run: async () => {
         const result = await browsersAPI.closeAll()
         toast('ok', result.message)
@@ -470,7 +532,7 @@ export default function ProfilesPage() {
     try {
       await action.run()
     } catch (err) {
-      toast('error', 'Action failed', String(err))
+      toast('error', t('Action failed'), String(err))
     }
   }
 
@@ -486,9 +548,9 @@ export default function ProfilesPage() {
       link.click()
       link.remove()
       URL.revokeObjectURL(url)
-      toast('ok', 'Exported to camoufox-profiles.xlsx', 'The file contains proxy passwords in clear text.')
+      toast('ok', t('Exported to camoufox-profiles.xlsx'), t('The file contains proxy passwords in clear text.'))
     } catch (err) {
-      toast('error', 'Export failed', String(err))
+      toast('error', t('Export failed'), String(err))
     }
   }
 
@@ -499,24 +561,24 @@ export default function ProfilesPage() {
     try {
       const result = await profilesAPI.importExcel(file)
       if (result.success) {
-        toast('ok', `Imported ${result.data?.created_count ?? 0} profiles`)
+        toast('ok', t('Imported {count} profiles', { count: result.data?.created_count ?? 0 }))
         loadProfiles()
       } else {
         toast(
           'error',
-          'Import finished with errors',
+          t('Import finished with errors'),
           (result.data?.errors ?? []).slice(0, 3).join('\n') || result.message,
         )
       }
     } catch (err) {
-      toast('error', 'Import failed', String(err))
+      toast('error', t('Import failed'), String(err))
     }
   }
 
   return (
     <>
       <header className="sticky top-0 z-20 flex h-[52px] items-center gap-3 border-b border-line bg-canvas/85 px-5 backdrop-blur">
-        <h1 className="text-[14px] font-semibold">Profiles</h1>
+        <h1 className="text-[14px] font-semibold">{t('Profiles')}</h1>
         <span className="font-mono text-ink-faint">{visible.length}</span>
 
         <div className="relative ml-3 w-[240px]">
@@ -526,40 +588,42 @@ export default function ProfilesPage() {
           />
           <input
             className="field h-[30px] pl-7"
-            placeholder="Search name or ID"
+            placeholder={t('Search name or ID')}
             value={search}
             onChange={(event) => setSearch(event.target.value)}
-            aria-label="Search profiles"
+            aria-label={t('Search profiles')}
           />
         </div>
 
         <select
           className="field h-[30px] w-[132px]"
           value={statusFilter}
-          onChange={(event) => setStatusFilter(event.target.value)}
-          aria-label="Filter by status"
+          onChange={(event) => setStatusFilter(event.target.value as ProfileViewConfig['status'])}
+          aria-label={t('Filter by status')}
         >
-          <option value="all">All statuses</option>
-          <option value="active">Active</option>
-          <option value="inactive">Inactive</option>
-          <option value="blocked">Blocked</option>
-          <option value="maintenance">Maintenance</option>
+          <option value="all">{t('All statuses')}</option>
+          <option value="active">{t('Active')}</option>
+          <option value="inactive">{t('Inactive')}</option>
+          <option value="blocked">{t('Blocked')}</option>
+          <option value="maintenance">{t('Maintenance')}</option>
         </select>
 
         <div className="ml-auto flex items-center gap-2">
-          {running.size > 0 && (
+          {canManageAccess && <button className="btn btn-default" onClick={() => setSyncFor('available')}>{t('Profiles from trusted devices')}</button>}
+          {running.size > 0 && (canManageAccess || role === 'operator') && (
             <button className="btn btn-default" onClick={askCloseAll}>
               <Square size={12} fill="currentColor" />
-              Close {running.size} running
+              {t('Close {count} running', { count: running.size })}
             </button>
           )}
-          <button className="btn btn-ghost" onClick={() => setExportOpen(true)} title="Export to Excel">
+          {profiles.some(profile => can(profile, 'export')) && <button className="btn btn-ghost" onClick={() => setExportOpen(true)} title={t('Export to Excel')}>
             <Download size={14} />
-          </button>
+          </button>}
+          {canManageAccess && <>
           <button
             className="btn btn-ghost"
             onClick={() => importRef.current?.click()}
-            title="Import from Excel"
+            title={t('Import from Excel')}
           >
             <Upload size={14} />
           </button>
@@ -573,7 +637,7 @@ export default function ProfilesPage() {
           <button
             className="btn btn-ghost"
             onClick={() => archiveRef.current?.click()}
-            title="Import a profile archive"
+            title={t('Import a profile archive')}
           >
             <PackageOpen size={14} />
           </button>
@@ -592,14 +656,29 @@ export default function ProfilesPage() {
             }}
           >
             <Plus size={14} strokeWidth={2.5} />
-            New profile
+            {t('New profile')}
           </button>
+          </>}
         </div>
       </header>
 
+      <section aria-label={t('Profile filters and saved views')} className="border-b border-line bg-surface px-5 py-3">
+        {canManageAccess && <SavedProfileViews config={viewConfig} onApply={applyView} />}
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <label htmlFor="profile-group-filter" className="text-ink-dim">{t('Group')}</label>
+          <select id="profile-group-filter" className="field h-[30px] w-[170px]" value={groupFilter ?? ''} onChange={event => setGroupFilter(event.target.value || null)}><option value="">{t('All groups')}</option><option value="__ungrouped__">{t('Ungrouped')}</option>{groupFilter && groupFilter !== '__ungrouped__' && !groups.some(group => group.id === groupFilter) && <option value={groupFilter}>{t('Unavailable group ({id})', { id: groupFilter })}</option>}{groups.map(group => <option key={group.id} value={group.id}>{group.name}</option>)}</select>
+          <label htmlFor="profile-tag-filter" className="text-ink-dim">{t('Tags')}</label>
+          <select id="profile-tag-filter" className="field h-[30px] w-[170px]" value="" disabled={tagFilters.length >= 20} onChange={event => { if (event.target.value && !tagFilters.includes(event.target.value)) setTagFilters(current => [...current, event.target.value]) }}><option value="">{t('Add tag filter')}</option>{availableTags.filter(tag => !tagFilters.includes(tag)).map(tag => <option key={tag} value={tag}>{tag}</option>)}</select>
+          {tagFilters.map(tag => <button key={tag} className="btn btn-default h-7" onClick={() => setTagFilters(current => current.filter(value => value !== tag))} aria-label={t('Remove tag filter {tag}', { tag })}>{tag} ×</button>)}
+          {tagFilters.length > 0 && <span className="text-[11px] text-ink-dim">{t('Match all selected tags')}</span>}
+          <button className="btn btn-ghost ml-auto" onClick={() => applyView(DEFAULT_VIEW)}>{t('Clear filters')}</button>
+        </div>
+      </section>
+
       {selected.size > 0 && (
         <div className="flex items-center gap-3 border-b border-line bg-raised px-5 py-2">
-          <span>{selected.size} selected</span>
+          <span>{t('{count} selected', { count: selected.size })}</span>
+          <button className="btn btn-default h-7" onClick={() => setTagsFor(profiles.filter(profile => selected.has(profile.id)))}><Tags size={13} aria-hidden="true" />{t('Edit tags')}</button>
           {selectedWithProxy > 0 && (
             <button
               className="btn btn-default h-7"
@@ -608,45 +687,47 @@ export default function ProfilesPage() {
             >
               <Globe size={13} />
               {checkingProxies.size > 0
-                ? `Checking… (${checkingProxies.size})`
-                : `Check proxies (${selectedWithProxy})`}
+                ? t('Checking… ({count})', { count: checkingProxies.size })
+                : t('Check proxies ({count})', { count: selectedWithProxy })}
             </button>
           )}
           {selectedWithGeography > 0 && (
             <button className="btn btn-default h-7" onClick={askClearGeography}>
               <Globe size={13} />
-              Clear geography ({selectedWithGeography})
+              {t('Clear geography ({count})', { count: selectedWithGeography })}
             </button>
           )}
           <button className="btn btn-danger h-7" onClick={askBulkDelete}>
             <Trash2 size={13} />
-            Delete
+            {t('Move to Trash')}
           </button>
           <button className="btn btn-ghost h-7" onClick={() => setSelected(new Set())}>
-            Clear
+            {t('Clear')}
           </button>
         </div>
       )}
 
+      {canManageAccess && !loading && !error && <BrowserSetup firstProfile={profiles.length === 0} onCreate={() => { setEditing(null); setFormOpen(true) }} />}
+
       {error ? (
         <EmptyState
           icon={<Users size={18} />}
-          title="Cannot reach the API"
+          title={t('Cannot reach the API')}
           body={error}
           action={
             <button className="btn btn-default" onClick={loadProfiles}>
-              Retry
+              {t('Retry')}
             </button>
           }
         />
       ) : loading ? (
-        <p className="px-5 py-8 text-ink-faint">Loading…</p>
+        <p className="px-5 py-8 text-ink-faint">{t('Loading…')}</p>
       ) : profiles.length === 0 ? (
         <EmptyState
           icon={<Users size={18} />}
-          title="No profiles yet"
-          body="A profile is one isolated browser identity — its own fingerprint, proxy, cookies and storage. Create one to get started."
-          action={
+          title={t('No profiles yet')}
+          body={canManageAccess ? t('A profile is one isolated browser identity — its own fingerprint, proxy, cookies and storage. Create one to get started.') : t('Ask an administrator to grant you access to profiles.')}
+          action={canManageAccess && (
             <button
               className="btn btn-primary"
               onClick={() => {
@@ -655,24 +736,23 @@ export default function ProfilesPage() {
               }}
             >
               <Plus size={14} strokeWidth={2.5} />
-              Create your first profile
+              {t('Create your first profile')}
             </button>
-          }
+          )}
         />
       ) : visible.length === 0 ? (
         <EmptyState
           icon={<Search size={18} />}
-          title="No matches"
-          body="No profile matches the current search and filter."
+          title={t('No matches')}
+          body={t('No profile matches the current search and filter.')}
           action={
             <button
               className="btn btn-default"
               onClick={() => {
-                setSearch('')
-                setStatusFilter('all')
+                applyView(DEFAULT_VIEW)
               }}
             >
-              Clear filters
+              {t('Clear filters')}
             </button>
           }
         />
@@ -684,8 +764,9 @@ export default function ProfilesPage() {
                 <input
                   type="checkbox"
                   className="accent-signal"
+                  disabled={!canManageAccess && role !== 'operator'}
                   checked={allOnPageSelected}
-                  aria-label="Select all on this page"
+                  aria-label={t('Select all on this page')}
                   onChange={() =>
                     setSelected((current) => {
                       const next = new Set(current)
@@ -703,18 +784,20 @@ export default function ProfilesPage() {
                     className="inline-flex items-center gap-1 hover:text-ink"
                     onClick={() => toggleSort(column.key)}
                   >
-                    {column.label}
+                    {t(column.label)}
                     {sortKey === column.key &&
                       (sortDir === 'asc' ? <ArrowUp size={11} /> : <ArrowDown size={11} />)}
                   </button>
                 </th>
               ))}
-              <th className="py-2 pr-4 font-medium">Proxy</th>
+              <th className="py-2 pr-4 font-medium">{t('Proxy')}</th>
               <th className="w-[104px] py-2 pr-5" />
             </tr>
           </thead>
           <tbody>
             {pageRows.map((profile, index) => {
+              const syncBinding = syncBindings.find(binding => binding.local_id === profile.id)
+              const syncBlocked = !!syncBinding && (syncBinding.phase !== 'held' || syncBinding.lifecycle?.state === 'trashed' || syncBinding.local_trashed === true)
               const isRunning = running.has(profile.id)
               const isBusy = busy.has(profile.id)
               return (
@@ -731,8 +814,9 @@ export default function ProfilesPage() {
                     <input
                       type="checkbox"
                       className="accent-signal"
+                      disabled={!can(profile, 'edit')}
                       checked={selected.has(profile.id)}
-                      aria-label={`Select ${profile.name}`}
+                      aria-label={t('Select {name}', { name: profile.name })}
                       onChange={() =>
                         setSelected((current) => {
                           const next = new Set(current)
@@ -744,7 +828,7 @@ export default function ProfilesPage() {
                     />
                   </td>
 
-                  <td className="py-2.5 pr-4 font-medium">{profile.name}</td>
+                  <td className="py-2.5 pr-4 font-medium"><p>{profile.name}</p>{(profile.tags ?? []).length > 0 && <div className="mt-1 flex max-w-[240px] flex-wrap gap-1">{profile.tags?.map(tag => <button key={tag} className="rounded border border-line bg-raised px-1.5 py-px text-[11px] font-normal text-ink-dim hover:text-ink" aria-label={t('Filter by tag {tag}', { tag })} onClick={() => setTagFilters([tag])}>{tag}</button>)}</div>}</td>
                   <td className="py-2.5 pr-4 font-mono text-ink-faint">{profile.id}</td>
                   <td className="py-2.5 pr-4 text-ink-dim">
                     {profile.group ? (groupNames.get(profile.group) ?? profile.group) : '—'}
@@ -754,8 +838,9 @@ export default function ProfilesPage() {
                   </td>
                   <td className="py-2.5 pr-4">
                     <StatusCell status={profile.status} running={isRunning} />
+                    {syncBinding && <button className="mt-1 block text-left text-xs text-ink-dim underline underline-offset-2" onClick={() => setSyncFor(profile)}>{t(syncBinding.lifecycle?.state === 'trashed' ? 'Synchronized profile is in Trash' : syncPhaseLabel(syncBinding.phase))}</button>}
                   </td>
-                  <td className="py-2.5 pr-4 text-ink-dim">{formatLastUsed(profile.last_used)}</td>
+                  <td className="py-2.5 pr-4 text-ink-dim">{formatLastUsed(profile.last_used, locale)}</td>
                   <td className="py-2.5 pr-4">
                     <ProxyCell
                       profile={profile}
@@ -767,18 +852,18 @@ export default function ProfilesPage() {
                     <div className="flex items-center justify-end gap-1">
                       <button
                         className="btn btn-default h-7"
-                        disabled={isBusy}
+                        disabled={isBusy || !can(profile, 'launch') || (!isRunning && syncBlocked)}
                         onClick={() => (isRunning ? stop(profile) : launch(profile))}
                       >
                         {isRunning ? (
                           <>
                             <Square size={11} fill="currentColor" />
-                            Stop
+                            {t('Stop')}
                           </>
                         ) : (
                           <>
                             <Play size={11} fill="currentColor" />
-                            Run
+                            {t('Run')}
                           </>
                         )}
                       </button>
@@ -786,7 +871,7 @@ export default function ProfilesPage() {
                       <div className="relative">
                         <button
                           className="btn btn-ghost h-7 w-7 p-0"
-                          aria-label={`Actions for ${profile.name}`}
+                          aria-label={t('Actions for {name}', { name: profile.name })}
                           aria-haspopup="menu"
                           aria-expanded={menuFor === profile.id}
                           data-menu-trigger={profile.id}
@@ -824,7 +909,7 @@ export default function ProfilesPage() {
                           >
                             <MenuItem
                               icon={<Pencil size={13} />}
-                              label="Edit"
+                              allowed={can(profile, 'edit')} label={t('Edit')}
                               autoFocus
                               onClick={() => {
                                 setEditing(profile)
@@ -834,7 +919,7 @@ export default function ProfilesPage() {
                             />
                             <MenuItem
                               icon={<Copy size={13} />}
-                              label="Duplicate"
+                              allowed={canManageAccess} label={t('Duplicate')}
                               onClick={() => {
                                 clone(profile)
                                 closeMenu(profile.id)
@@ -842,7 +927,7 @@ export default function ProfilesPage() {
                             />
                             <MenuItem
                               icon={<Globe size={13} />}
-                              label="Check proxy"
+                              allowed={can(profile, 'edit')} label={t('Check proxy')}
                               onClick={() => {
                                 // The set holds ids, not a count, so a second
                                 // check of the same row would clear the first
@@ -851,9 +936,13 @@ export default function ProfilesPage() {
                                 closeMenu(profile.id)
                               }}
                             />
+                            <MenuItem icon={<Globe size={13} />} allowed={canManageAccess} label={t('Device synchronization')} onClick={() => { setSyncFor(profile); closeMenu(profile.id) }} />
+                            <MenuItem icon={<Cookie size={13} />} allowed={can(profile, 'edit') || can(profile, 'export')} label={t('Cookies')} onClick={() => { setCookiesFor(profile); closeMenu(profile.id) }} />
+                            <MenuItem icon={<Bookmark size={13} />} allowed={canManageAccess} label={t('Save as template')} onClick={() => { setTemplateFor(profile); closeMenu(profile.id) }} />
+                            <MenuItem icon={<Puzzle size={13} />} allowed={can(profile, 'edit')} label={t('Extensions')} onClick={() => { setExtensionsFor(profile); closeMenu(profile.id) }} />
                             <MenuItem
                               icon={<PackageOpen size={13} />}
-                              label="Export…"
+                              allowed={can(profile, 'export')} label={t('Export…')}
                               onClick={() => {
                                 exportArchive(profile)
                                 closeMenu(profile.id)
@@ -861,7 +950,7 @@ export default function ProfilesPage() {
                             />
                             <MenuItem
                               icon={<Trash2 size={13} />}
-                              label="Delete"
+                              allowed={can(profile, 'edit')} label={t('Move to Trash')}
                               danger
                               onClick={() => {
                                 askDelete(profile)
@@ -883,15 +972,14 @@ export default function ProfilesPage() {
       {totalPages > 1 && (
         <div className="flex items-center justify-between px-5 py-3 text-ink-dim">
           <span>
-            {(currentPage - 1) * perPage + 1}–{Math.min(currentPage * perPage, visible.length)} of{' '}
-            {visible.length}
+            {t('{start}–{end} of {count}', { start: (currentPage - 1) * perPage + 1, end: Math.min(currentPage * perPage, visible.length), count: visible.length })}
           </span>
           <div className="flex items-center gap-1">
             <button
               className="btn btn-ghost h-7 w-7 p-0"
               disabled={currentPage === 1}
               onClick={() => setPage(currentPage - 1)}
-              aria-label="Previous page"
+              aria-label={t('Previous page')}
             >
               <ChevronLeft size={15} />
             </button>
@@ -902,13 +990,19 @@ export default function ProfilesPage() {
               className="btn btn-ghost h-7 w-7 p-0"
               disabled={currentPage === totalPages}
               onClick={() => setPage(currentPage + 1)}
-              aria-label="Next page"
+              aria-label={t('Next page')}
             >
               <ChevronRight size={15} />
             </button>
           </div>
         </div>
       )}
+
+      {cookiesFor && <CookieTransfer profile={cookiesFor} onClose={() => setCookiesFor(null)} onChanged={loadProfiles} />}
+      {templateFor && <TemplateFromProfileModal profile={templateFor} onClose={() => setTemplateFor(null)} onSaved={loadProfiles} />}
+      {syncFor && <ProfileSyncPanel profile={syncFor === 'available' ? null : syncFor} running={syncFor !== 'available' && running.has(syncFor.id)} onClose={() => setSyncFor(null)} onSaved={loadProfiles} />}
+      {extensionsFor && <ProfileExtensionsModal profile={extensionsFor} onClose={() => setExtensionsFor(null)} onSaved={loadProfiles} />}
+      {tagsFor && <ProfileTagsDialog profiles={tagsFor} onClose={() => setTagsFor(null)} onUpdated={updated => { setProfiles(current => current.map(profile => updated.find(item => item.id === profile.id) ?? profile)); setSelected(new Set()) }} />}
 
       <ProfileForm
         open={formOpen}
@@ -930,24 +1024,22 @@ export default function ProfilesPage() {
 
       <Modal
         open={exportOpen}
-        title="Export to Excel"
+        title={t('Export to Excel')}
         onClose={() => setExportOpen(false)}
         width={440}
         footer={
           <>
             <button className="btn btn-default" onClick={() => setExportOpen(false)}>
-              Cancel
+              {t('Cancel')}
             </button>
             <button className="btn btn-primary" onClick={exportExcel}>
-              Export
+              {t('Export')}
             </button>
           </>
         }
       >
         <p className="text-ink-dim">
-          The spreadsheet includes every profile setting so it can be imported back — including
-          <span className="text-ink"> proxy passwords in clear text</span>. Store the file somewhere
-          you would keep the passwords themselves.
+          {t('The spreadsheet includes every profile setting so it can be imported back — including proxy passwords in clear text. Store the file somewhere you would keep the passwords themselves.')}
         </p>
       </Modal>
     </>
@@ -961,6 +1053,7 @@ export default function ProfilesPage() {
  * checked looks exactly as it did before.
  */
 function ProxyCell({ profile, checking }: { profile: Profile; checking: boolean }) {
+  const { t } = useI18n()
   const configured = formatProxyString(profile.proxy_config) || '—'
   const check = profile.proxy_check
 
@@ -973,7 +1066,7 @@ function ProxyCell({ profile, checking }: { profile: Profile; checking: boolean 
       {checking ? (
         <div className="mt-0.5 flex items-center gap-1.5 text-[11px] text-ink-faint">
           <span className="signal-pulse h-1.5 w-1.5 rounded-full bg-signal" />
-          Checking…
+          {t('Checking…')}
         </div>
       ) : check ? (
         <ProxyResult check={check} />
@@ -983,7 +1076,8 @@ function ProxyCell({ profile, checking }: { profile: Profile; checking: boolean 
 }
 
 function ProxyResult({ check }: { check: ProxyCheckRecord }) {
-  const { tone, label, detail } = readProxyCheck(check)
+  const { locale } = useI18n()
+  const { tone, label, detail } = readProxyCheck(check, locale)
   const dot = tone === 'ok' ? 'bg-ok' : tone === 'warn' ? 'bg-warn' : 'bg-danger'
   // Latency and country only mean something when the proxy answered; when it did
   // not, the reason is the only thing worth the space.
@@ -998,17 +1092,18 @@ function ProxyResult({ check }: { check: ProxyCheckRecord }) {
       {/* min-w-0 so this is the part that gives way: a flex item will not shrink
           below its content without it, and the truncation never happens. */}
       <span className="min-w-0 truncate font-mono">{parts.filter(Boolean).join(' · ')}</span>
-      <span className="shrink-0 text-ink-dim/70">· {formatLastUsed(check.checked_at)}</span>
+      <span className="shrink-0 text-ink-dim/70">· {formatLastUsed(check.checked_at, locale)}</span>
     </div>
   )
 }
 
 function StatusCell({ status, running }: { status: string; running: boolean }) {
+  const { t } = useI18n()
   if (running) {
     return (
       <span className="inline-flex items-center gap-1.5 text-signal">
         <span className="signal-pulse h-1.5 w-1.5 rounded-full bg-signal" />
-        Running
+        {t('Running')}
       </span>
     )
   }
@@ -1017,7 +1112,7 @@ function StatusCell({ status, running }: { status: string; running: boolean }) {
   return (
     <span className="inline-flex items-center gap-1.5 capitalize text-ink-dim">
       <span className={`h-1.5 w-1.5 rounded-full ${tone}`} />
-      {status}
+      {t(status)}
     </span>
   )
 }
@@ -1028,13 +1123,16 @@ function MenuItem({
   onClick,
   danger,
   autoFocus,
+  allowed = true,
 }: {
   icon: React.ReactNode
   label: string
   onClick: () => void
   danger?: boolean
   autoFocus?: boolean
+  allowed?: boolean
 }) {
+  if (!allowed) return null
   return (
     <button
       role="menuitem"

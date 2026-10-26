@@ -3,33 +3,42 @@
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { CalendarClock, Layers, LogOut, Settings, Users } from 'lucide-react'
+import { CalendarClock, Copy, Layers, LogOut, Puzzle, Settings, Network, Trash2, Users, Shield } from 'lucide-react'
 
+import { useI18n } from '@/components/i18n-provider'
+import { LanguageSelector } from '@/components/language-selector'
 import { useAuth } from '@/components/login-gate'
 import { systemAPI } from '@/lib/api'
 
 const NAV = [
   { href: '/', label: 'Profiles', icon: Users },
+  { href: '/proxies/', label: 'Proxy library', icon: Network },
+  { href: '/templates/', label: 'Templates', icon: Copy },
+  { href: '/extensions/', label: 'Extensions', icon: Puzzle },
   { href: '/groups/', label: 'Groups', icon: Layers },
   { href: '/schedules/', label: 'Schedules', icon: CalendarClock },
+  { href: '/trash/', label: 'Trash', icon: Trash2 },
+  { href: '/access/', label: 'Access and activity', icon: Shield },
   { href: '/settings/', label: 'Settings', icon: Settings },
 ]
 
 /** Fixed rail + scrollable work area. The rail never scrolls. */
 export function AppShell({ children }: { children: React.ReactNode }) {
+  const { t } = useI18n()
   const pathname = usePathname()
   // trailingSlash is on for the static export, so normalise before comparing.
   const current = pathname.replace(/\/+$/, '') || '/'
   const [address, setAddress] = useState<string | null>(null)
-  const { username, logout } = useAuth()
+  const { username, logout, canManageAccess } = useAuth()
 
   useEffect(() => {
     // Report where the server actually is rather than assuming loopback.
+    if (!canManageAccess) return
     systemAPI
       .config()
       .then((config) => setAddress(`${config.host}:${config.port}`))
       .catch(() => setAddress(null))
-  }, [])
+  }, [canManageAccess])
 
   return (
     <div className="flex h-screen">
@@ -39,7 +48,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </div>
 
         <nav className="flex flex-col gap-px p-2">
-          {NAV.map(({ href, label, icon: Icon }) => {
+          {NAV.filter(item => canManageAccess || item.href === '/').map(({ href, label, icon: Icon }) => {
             const target = href.replace(/\/+$/, '') || '/'
             const active = current === target
             return (
@@ -54,13 +63,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 }`}
               >
                 <Icon size={15} strokeWidth={1.75} className={active ? 'text-signal' : ''} />
-                {label}
+                {t(label)}
               </Link>
             )
           })}
         </nav>
 
         <div className="mt-auto">
+          <div className="px-4 py-3"><LanguageSelector /></div>
           {username && (
             <div className="flex items-center justify-between gap-2 border-t border-line px-4 py-2">
               <span className="truncate text-ink-dim" title={username}>
@@ -69,8 +79,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               <button
                 type="button"
                 onClick={logout}
-                aria-label="Log out"
-                title="Log out"
+                aria-label={t('Log out')}
+                title={t('Log out')}
                 className="rounded p-1 text-ink-faint transition-colors hover:bg-raised hover:text-ink"
               >
                 <LogOut size={14} strokeWidth={1.75} />
@@ -81,7 +91,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </div>
       </aside>
 
-      <main className="flex-1 overflow-y-auto">{children}</main>
+      <main className="min-w-0 flex-1 overflow-y-auto">{canManageAccess || current === '/' ? children : <div className="p-6" role="alert">{t('Access denied')}</div>}</main>
     </div>
   )
 }

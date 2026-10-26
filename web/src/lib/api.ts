@@ -1,3 +1,5 @@
+import { translate, type Locale, type Translator } from './i18n'
+
 // API client for the Camoufox Profile Manager backend.
 //
 // The UI is served by the API on the same origin, so the base URL is empty by
@@ -10,6 +12,7 @@ export const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? ''
 const API_PREFIX = '/api/v1'
 
 export interface BrowserSettings {
+  browser_ui?: 'desktop' | 'camoufox'
   os: string
   screen: string
   user_agent?: string | null
@@ -69,8 +72,10 @@ export interface FingerprintSummary {
 
 export interface Profile {
   id: string
+  permissions?: { view: boolean; edit: boolean; launch: boolean; export: boolean }
   name: string
   group?: string | null
+  tags?: string[]
   status: string
   browser_settings: BrowserSettings
   proxy_config?: ProxyConfig | null
@@ -145,7 +150,12 @@ const API_KEY_STORAGE = 'camoufox-pm.api-key'
 /** The key CPM_API_KEY expects, if the user has stored one. */
 export function getApiKey(): string {
   if (typeof window === 'undefined') return ''
-  return window.localStorage.getItem(API_KEY_STORAGE) ?? ''
+  try {
+    return window.localStorage.getItem(API_KEY_STORAGE) ?? ''
+  } catch {
+    // Cookie/local authentication remains usable when browser storage is blocked.
+    return ''
+  }
 }
 
 export function setApiKey(key: string): void {
@@ -159,21 +169,23 @@ export function authHeaders(): Record<string, string> {
   return key ? { 'X-API-Key': key } : {}
 }
 
+export function notifyAccessDenied(status: number): void {
+  if ((status === 401 || status === 403) && typeof window !== 'undefined') window.dispatchEvent(new Event('camoufox-access-denied'))
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     // Spread options first: putting it last let a caller's `headers` replace the
     // merged object, silently dropping Content-Type and the API key.
     ...options,
     headers: {
-      'Content-Type': 'application/json',
+      ...(typeof FormData !== 'undefined' && options?.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
       ...authHeaders(),
       ...(options?.headers ?? {}),
     },
   })
   if (!response.ok) {
-    if (response.status === 401 && !path.includes('/auth/') && typeof window !== 'undefined') {
-      window.dispatchEvent(new Event('camoufox-access-denied'))
-    }
+    if (!path.includes('/auth/')) notifyAccessDenied(response.status)
     let detail = response.statusText
     let code: string | undefined
     try {
@@ -192,10 +204,14 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
+/** Shared client for feature modules; preserves cookie/key auth and API errors. */
+export const apiRequest = request
+
 function toQuery(params: Record<string, unknown>): string {
   const query = new URLSearchParams()
   for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined && value !== null && value !== '') query.set(key, String(value))
+    if (Array.isArray(value)) value.forEach(item => query.append(key, String(item)))
+    else if (value !== undefined && value !== null && value !== '') query.set(key, String(value))
   }
   return query.toString() ? `?${query.toString()}` : ''
 }
@@ -236,7 +252,107 @@ export interface ProxyCheckRecord {
   findings: ProxyFinding[]
 }
 
+/** Saved library credentials are write-only; profiles receive an explicit snapshot. */
+export interface LibraryProxy {
+  id: string
+  name: string
+  type: string
+  server: string
+  username: string | null
+  country: string | null
+  has_password: boolean
+  row_version: number
+  last_check: ProxyCheckRecord | null
+  created_at: string
+  updated_at: string
+}
+
+export interface ProxyAssignmentResult {
+  assigned: string[]
+  skipped: { id: string; reason: string }[]
+}
+
+export interface ProxyImportResult {
+  created: LibraryProxy[]
+  skipped: { line: number; reason: string }[]
+}
+
+export const proxiesAPI = {
+  async list(): Promise<LibraryProxy[]> {
+    const body = await request<{ data: { proxies: LibraryProxy[] } }>(`${API_PREFIX}/proxies`)
+    return body.data.proxies
+  },
+  async create(data: Record<string, unknown>): Promise<LibraryProxy> {
+    const body = await request<{ data: LibraryProxy }>(`${API_PREFIX}/proxies`, { method: 'POST', body: JSON.stringify(data) })
+    return body.data
+  },
+  async update(id: string, data: Record<string, unknown>): Promise<LibraryProxy> {
+    const body = await request<{ data: LibraryProxy }>(`${API_PREFIX}/proxies/${id}`, { method: 'PATCH', body: JSON.stringify(data) })
+    return body.data
+  },
+  remove(id: string, rowVersion: number): Promise<unknown> {
+    return request(`${API_PREFIX}/proxies/${id}?row_version=${rowVersion}`, { method: 'DELETE' })
+  },
+  async check(id: string): Promise<LibraryProxy> {
+    const body = await request<{ data: LibraryProxy }>(`${API_PREFIX}/proxies/${id}/check`, { method: 'POST' })
+    return body.data
+  },
+  async assign(proxy: LibraryProxy, profiles: Pick<Profile, 'id' | 'row_version'>[]): Promise<ProxyAssignmentResult> {
+    const body = await request<{ data: ProxyAssignmentResult }>(`${API_PREFIX}/proxies/${proxy.id}/assign`, { method: 'POST', body: JSON.stringify({ proxy_row_version: proxy.row_version, profiles: profiles.map(({ id, row_version }) => ({ id, row_version })) }) })
+    return body.data
+  },
+  async importText(text: string): Promise<ProxyImportResult> {
+    const body = await request<{ data: ProxyImportResult }>(`${API_PREFIX}/proxies/import`, { method: 'POST', body: JSON.stringify({ text }) })
+    return body.data
+  },
+}
+
+export interface ProfileViewConfig {
+  search: string
+  status: 'all' | 'active' | 'inactive' | 'blocked' | 'maintenance'
+  group: string | null
+  tags: string[]
+  sort_key: 'name' | 'id' | 'group' | 'os' | 'status' | 'last_used'
+  sort_direction: 'asc' | 'desc'
+}
+
+export interface SavedFilter {
+  id: string
+  name: string
+  config: ProfileViewConfig
+  row_version: number
+  created_at: string
+  updated_at: string
+}
+
+export const savedFiltersAPI = {
+  async list(): Promise<SavedFilter[]> {
+    const body = await request<{ data: { filters: SavedFilter[] } }>(`${API_PREFIX}/saved-filters`)
+    return body.data.filters
+  },
+  async create(name: string, config: ProfileViewConfig): Promise<SavedFilter> {
+    const body = await request<{ data: SavedFilter }>(`${API_PREFIX}/saved-filters`, { method: 'POST', body: JSON.stringify({ name, config }) })
+    return body.data
+  },
+  async update(view: SavedFilter, data: { name?: string; config?: ProfileViewConfig }): Promise<SavedFilter> {
+    const body = await request<{ data: SavedFilter }>(`${API_PREFIX}/saved-filters/${view.id}`, { method: 'PATCH', body: JSON.stringify({ ...data, row_version: view.row_version }) })
+    return body.data
+  },
+  remove(view: SavedFilter): Promise<unknown> {
+    return request(`${API_PREFIX}/saved-filters/${view.id}?row_version=${view.row_version}`, { method: 'DELETE' })
+  },
+}
+
+export interface BulkTagsResult {
+  updated: Profile[]
+  skipped: { id: string; reason: string }[]
+}
+
 export const profilesAPI = {
+  async bulkTags(profiles: Profile[], add: string[], remove: string[]): Promise<BulkTagsResult> {
+    const body = await request<{ data: BulkTagsResult }>(`${API_PREFIX}/profiles/tags`, { method: 'POST', body: JSON.stringify({ profiles: profiles.map(({ id, row_version }) => ({ id, row_version })), add, remove }) })
+    return body.data
+  },
   getProfiles(params: Record<string, unknown> = {}): Promise<ProfilesResponse> {
     return request<ProfilesResponse>(`${API_PREFIX}/profiles${toQuery(params)}`)
   },
@@ -317,7 +433,7 @@ export const profilesAPI = {
     const response = await fetch(`${API_BASE_URL}${API_PREFIX}/profiles/export/excel`, {
       headers: authHeaders(),
     })
-    if (!response.ok) throw new Error(response.statusText)
+    if (!response.ok) { notifyAccessDenied(response.status); throw new ApiRequestError(response.statusText, response.status) }
     return response.blob()
   },
 
@@ -326,6 +442,7 @@ export const profilesAPI = {
       headers: authHeaders(),
     })
     if (!response.ok) {
+      notifyAccessDenied(response.status)
       const body = await response.json().catch(() => null)
       throw new Error(body?.detail ?? response.statusText)
     }
@@ -342,6 +459,7 @@ export const profilesAPI = {
       body,
     })
     if (!response.ok) {
+      notifyAccessDenied(response.status)
       const detail = await response.json().catch(() => null)
       throw new Error(detail?.detail ?? response.statusText)
     }
@@ -487,17 +605,87 @@ export interface SystemConfig {
   encryption_enabled: boolean
   cors_origins: string[]
   camoufox_available: boolean
-  browser_status: BrowserStatus['status']
-  browser_path: string
   uptime_seconds: number
 }
 
-export interface BrowserStatus {
-  status: 'missing' | 'downloading' | 'ready' | 'failed'
+export interface BrowserReadiness {
+  installed: boolean
+  version: string | null
+  state: 'idle' | 'downloading' | 'ready' | 'error'
   progress: number | null
   message: string
   error: string | null
-  path: string
+}
+
+export interface AppUpdate {
+  current_version: string
+  latest_version: string | null
+  available: boolean
+  release_url: string | null
+  assets: { name: string; url: string }[]
+  error?: string | null
+}
+
+export interface UpdateRecovery {
+  state: string
+  transaction_id?: string
+  created_at?: string
+  target_version?: string
+  browser_version?: string
+  maintenance_active: boolean
+  automatic_install_available: boolean
+  can_cancel: boolean
+  disabled_reason?: string | null
+  phase?: string | null
+  error?: string | null
+  can_download?: boolean
+  can_apply?: boolean
+  can_resume?: boolean
+  can_rollback?: boolean
+  checkpoint_timestamp?: string | null
+  request_pending?: boolean
+  rollback_transaction_id?: string | null
+  installed_version?: string
+}
+
+export interface BackupInfo {
+  id: string
+  profile_id: string
+  profile_name: string
+  created_at: string
+  reason: string
+  size_bytes: number
+}
+
+export interface BackupResult {
+  backups: BackupInfo[]
+  skipped: { profile_id: string; reason: string }[]
+}
+
+export const recoveryAPI = {
+  async trash(): Promise<(Profile & { deleted_at: string })[]> {
+    const body = await request<{ data: { profiles: (Profile & { deleted_at: string })[] } }>(`${API_PREFIX}/trash/profiles`)
+    return body.data.profiles
+  },
+  async restoreProfile(id: string): Promise<Profile> {
+    const body = await request<{ data: Profile }>(`${API_PREFIX}/trash/profiles/${id}/restore`, { method: 'POST' })
+    return body.data
+  },
+  permanentlyDelete(id: string): Promise<unknown> {
+    return request(`${API_PREFIX}/trash/profiles/${id}?confirm=true`, { method: 'DELETE' })
+  },
+  async backups(): Promise<BackupInfo[]> {
+    const body = await request<{ data: { backups: BackupInfo[] } }>(`${API_PREFIX}/system/backups`)
+    return body.data.backups
+  },
+  async createBackup(): Promise<BackupResult> {
+    const body = await request<{ data: BackupResult }>(`${API_PREFIX}/system/backups`, { method: 'POST', body: JSON.stringify({ reason: 'manual' }) })
+    return body.data
+  },
+  async restoreBackup(id: string): Promise<Profile> {
+    const body = await request<{ data: Profile }>(`${API_PREFIX}/system/backups/${id}/restore`, { method: 'POST', body: JSON.stringify({}) })
+    return body.data
+  },
 }
 
 /** A fingerprint captured from a real machine, bundled with Camoufox. */
@@ -522,6 +710,9 @@ export const presetsAPI = {
 
 /** The caller's authentication state, from GET /auth/session. */
 export interface AuthSession {
+  role?: 'administrator' | 'operator' | 'viewer' | null
+  actor_kind?: string
+  can_manage_access?: boolean
   user_auth_enabled: boolean
   authenticated: boolean
   username: string | null
@@ -547,6 +738,34 @@ export const authAPI = {
 }
 
 export const systemAPI = {
+  async browser(): Promise<BrowserReadiness> {
+    const body = await request<{ data: BrowserReadiness }>(`${API_PREFIX}/system/browser`)
+    return body.data
+  },
+  async installBrowser(): Promise<BrowserReadiness> {
+    const body = await request<{ data: BrowserReadiness }>(`${API_PREFIX}/system/browser/install`, { method: 'POST' })
+    return body.data
+  },
+  async updates(preview = false): Promise<AppUpdate> {
+    const body = await request<{ data: AppUpdate }>(`${API_PREFIX}/system/updates${preview ? '?channel=preview' : ''}`)
+    return body.data
+  },
+  async prepareUpdate(preview = false): Promise<{ release_url: string; backup_count: number; message: string }> {
+    const body = await request<{ data: { release_url: string; backup_count: number; message: string } }>(`${API_PREFIX}/system/updates/prepare${preview ? '?channel=preview' : ''}`, { method: 'POST' })
+    return body.data
+  },
+  downloadVerifiedUpdate(preview = false): Promise<UpdateRecovery> {
+    return request<UpdateRecovery>(`${API_PREFIX}/system/update-recovery/download`, { method: 'POST', body: JSON.stringify({ channel: preview ? 'preview' : 'stable' }) })
+  },
+  requestUpdateAction(action: 'apply' | 'rollback' | 'resume', transactionId: string, timestamp?: string | null): Promise<UpdateRecovery> {
+    return request<UpdateRecovery>(`${API_PREFIX}/system/update-recovery/${action}`, { method: 'POST', body: JSON.stringify({ transaction_id: transactionId, ...(action === 'rollback' ? { confirm_timestamp: timestamp } : {}) }) })
+  },
+  updateRecovery(): Promise<UpdateRecovery> {
+    return request<UpdateRecovery>(`${API_PREFIX}/system/update-recovery`)
+  },
+  cancelUpdatePreparation(): Promise<UpdateRecovery> {
+    return request<UpdateRecovery>(`${API_PREFIX}/system/update-recovery/cancel`, { method: 'POST' })
+  },
   status(): Promise<SystemStatus> {
     return request<SystemStatus>(`${API_PREFIX}/system/status`)
   },
@@ -554,14 +773,6 @@ export const systemAPI = {
   async config(): Promise<SystemConfig> {
     const body = await request<{ data: SystemConfig }>(`${API_PREFIX}/system/config`)
     return body.data
-  },
-
-  browser(): Promise<BrowserStatus> {
-    return request<BrowserStatus>(`${API_PREFIX}/system/browser`)
-  },
-
-  retryBrowser(): Promise<BrowserStatus> {
-    return request<BrowserStatus>(`${API_PREFIX}/system/browser/retry`, { method: 'POST' })
   },
 }
 
@@ -583,27 +794,29 @@ export function formatProxyString(proxy?: ProxyConfig | null): string {
  *
  * Derived rather than stored, so a row written by an older version cannot
  * disagree with the rules here. An error-level finding is red even when the
- * proxy answered — SOCKS credentials that Camoufox will drop means the launch
- * is wrong, which is not a milder problem than an unreachable proxy.
+ * proxy answered — unsupported SOCKS4 credentials mean the launch is wrong,
+ * which is not a milder problem than an unreachable proxy. SOCKS5 authentication
+ * is supported through the managed relay.
  */
-export function readProxyCheck(check: ProxyCheckRecord): {
+export function readProxyCheck(check: ProxyCheckRecord, locale: Locale = 'en'): {
   tone: 'ok' | 'warn' | 'danger'
   label: string
   detail: string
 } {
+  const t: Translator = (message, values) => translate(locale, message, values)
   const notes = check.findings.filter((finding) => finding.level !== 'info')
   const worst = notes.find((finding) => finding.level === 'error') ?? notes[0]
   // Repeats what the row shows on purpose: the line truncates, and an IPv6 exit
   // address is long enough to be cut off mid-address, taking the country and the
   // latency with it. The tooltip is the only place left to read them.
   const lines = [
-    check.reachable ? 'Proxy answered' : 'Proxy did not answer',
+    check.reachable ? t('Proxy answered') : t('Proxy did not answer'),
     check.error,
     check.ip,
     [check.country, check.timezone].filter(Boolean).join(' · ') || null,
     check.latency_ms !== null ? `${check.latency_ms} ms` : null,
     ...notes.map((finding) => finding.message),
-    `Checked ${formatLastUsed(check.checked_at).toLowerCase()}`,
+    t('Checked {time}', { time: formatLastUsed(check.checked_at, locale).toLowerCase() }),
   ].filter(Boolean)
 
   const tone = !check.reachable || worst?.level === 'error' ? 'danger' : worst ? 'warn' : 'ok'
@@ -613,22 +826,23 @@ export function readProxyCheck(check: ProxyCheckRecord): {
     // Green and amber differ only in hue at six pixels, which is exactly the
     // pair a deuteranope cannot separate. The table's other indicator pairs its
     // dot with a word; this one says the word to screen readers.
-    label: tone === 'ok' ? 'Healthy' : tone === 'warn' ? 'Needs attention' : 'Failing',
+    label: tone === 'ok' ? t('Healthy') : tone === 'warn' ? t('Needs attention') : t('Failing'),
     detail: lines.join('\n'),
   }
 }
 
-export function formatLastUsed(value?: string | null): string {
-  if (!value) return 'Never'
+export function formatLastUsed(value?: string | null, locale: Locale = 'en'): string {
+  const t: Translator = (message, values) => translate(locale, message, values)
+  if (!value) return t('Never')
   const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return 'Never'
+  if (Number.isNaN(date.getTime())) return t('Never')
 
   const seconds = Math.round((Date.now() - date.getTime()) / 1000)
-  if (seconds < 60) return 'Just now'
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`
-  if (seconds < 604800) return `${Math.floor(seconds / 86400)}d ago`
-  return date.toLocaleDateString()
+  if (seconds < 60) return t('Just now')
+  if (seconds < 3600) return t('{count}m ago', { count: Math.floor(seconds / 60) })
+  if (seconds < 86400) return t('{count}h ago', { count: Math.floor(seconds / 3600) })
+  if (seconds < 604800) return t('{count}d ago', { count: Math.floor(seconds / 86400) })
+  return date.toLocaleDateString(locale)
 }
 
 export const OS_LABELS: Record<string, string> = {
