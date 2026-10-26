@@ -2,7 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useState } from 'react'
 
-import { authAPI, type AuthSession } from '@/lib/api'
+import { authAPI, setApiKey, type AuthSession } from '@/lib/api'
 
 interface AuthState {
   /** The logged-in user, or null when login is off or not yet established. */
@@ -19,8 +19,8 @@ export function useAuth(): AuthState {
 /**
  * Blocks the app behind a login form when the instance has user accounts.
  * The gate is presentation only — the API guard is what actually protects
- * every request — so if the session probe itself fails (API down, old
- * backend), it fails open and lets the API's own errors surface.
+ * every request. An unavailable session probe keeps protected content hidden
+ * until the caller can be verified.
  */
 export function LoginGate({ children }: { children: React.ReactNode }) {
   const [session, setSession] = useState<AuthSession | null>(null)
@@ -31,6 +31,7 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
       setSession(await authAPI.session())
       setProbeFailed(false)
     } catch {
+      setSession(null)
       setProbeFailed(true)
     }
   }, [])
@@ -40,6 +41,15 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
     // cannot see through the async boundary and assumes the worst.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     refresh()
+  }, [refresh])
+
+  useEffect(() => {
+    const denied = () => {
+      setSession(null)
+      void refresh()
+    }
+    window.addEventListener('camoufox-access-denied', denied)
+    return () => window.removeEventListener('camoufox-access-denied', denied)
   }, [refresh])
 
   const logout = useCallback(async () => {
@@ -53,14 +63,85 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
     return null
   }
 
-  if (session && session.user_auth_enabled && !session.authenticated) {
-    return <LoginScreen onLoggedIn={setSession} />
+  if (session && !session.authenticated) {
+    return session.user_auth_enabled ? (
+      <LoginScreen onLoggedIn={setSession} />
+    ) : (
+      <ApiKeyScreen onAuthenticated={setSession} />
+    )
   }
+
+  if (probeFailed) return <SessionUnavailable onRetry={refresh} />
 
   return (
     <AuthContext.Provider value={{ username: session?.username ?? null, logout }}>
       {children}
     </AuthContext.Provider>
+  )
+}
+
+function ApiKeyScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSession) => void }) {
+  const [key, setKey] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault()
+    setBusy(true)
+    setError(null)
+    try {
+      setApiKey(key.trim())
+      const session = await authAPI.session()
+      if (!session.authenticated) {
+        setApiKey('')
+        setError('Invalid API key')
+        return
+      }
+      onAuthenticated(session)
+    } catch (err) {
+      setApiKey('')
+      setError(String(err instanceof Error ? err.message : err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="flex h-screen items-center justify-center">
+      <form onSubmit={submit} className="panel flex w-[300px] flex-col gap-3 p-5">
+        <h1 className="text-[14px] font-semibold">API key required</h1>
+        <label className="flex flex-col gap-1">
+          <span className="text-ink-dim">API key for this browser</span>
+          <input
+            type="password"
+            className="field font-mono"
+            value={key}
+            onChange={(event) => setKey(event.target.value)}
+            autoComplete="off"
+            autoFocus
+          />
+        </label>
+        {error && <p className="text-danger">{error}</p>}
+        <button type="submit" className="btn btn-primary" disabled={busy || !key.trim()}>
+          {busy ? 'Checking...' : 'Save'}
+        </button>
+        <p className="text-ink-dim">Stored in this browser only, and sent as X-API-Key.</p>
+      </form>
+    </div>
+  )
+}
+
+function SessionUnavailable({ onRetry }: { onRetry: () => Promise<void> }) {
+  return (
+    <div className="flex h-screen items-center justify-center">
+      <div className="panel flex w-[300px] flex-col gap-3 p-5">
+        <h1 className="text-[14px] font-semibold">Server unavailable</h1>
+        <p className="text-ink-dim">Could not verify access. Check the server and try again.</p>
+        <button type="button" className="btn btn-primary" onClick={() => void onRetry()}>
+          Retry
+        </button>
+      </div>
+    </div>
   )
 }
 

@@ -415,6 +415,8 @@ class BrowserSessionManager:
             self.active_sessions[profile_id] = session
             try:
                 await session.open_urls(initial_urls or [])
+                if not initial_urls:
+                    await session.activate()
             except Exception:
                 self.active_sessions.pop(profile_id, None)
                 await session.terminate()

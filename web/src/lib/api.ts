@@ -171,6 +171,9 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     },
   })
   if (!response.ok) {
+    if (response.status === 401 && !path.includes('/auth/') && typeof window !== 'undefined') {
+      window.dispatchEvent(new Event('camoufox-access-denied'))
+    }
     let detail = response.statusText
     let code: string | undefined
     try {

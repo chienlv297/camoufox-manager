@@ -121,6 +121,9 @@ uv run camoufox-pm
 origin as the API, so there is no proxy or CORS to configure. Full options in
 [docs/cli.md](docs/cli.md).
 
+For the local Windows setup and one-command launcher, see
+[docs/local-run-windows.md](docs/local-run-windows.md).
+
 ### As a desktop window
 
 ```bash

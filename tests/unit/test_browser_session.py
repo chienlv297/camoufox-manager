@@ -177,6 +177,23 @@ async def test_launching_a_profile_twice_reuses_the_running_browser(installed):
 
 
 @pytest.mark.asyncio
+async def test_launch_without_initial_urls_maximizes_the_new_window(installed, monkeypatch):
+    installed(FakeCamoufox())
+    mgr = BrowserSessionManager()
+    maximized = []
+    profile_path = "profile-p1"
+
+    def maximize(path):
+        maximized.append(path)
+
+    monkeypatch.setattr(bs, "_maximize_and_focus_window", maximize)
+
+    await mgr.launch("p1", {"user_data_dir": profile_path})
+
+    assert maximized == [profile_path]
+
+
+@pytest.mark.asyncio
 async def test_initial_urls_reuse_initial_tab_and_repeated_launch_focuses_it(installed):
     camoufox = installed(FakeCamoufox())
     mgr = BrowserSessionManager()

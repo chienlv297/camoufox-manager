@@ -16,5 +16,7 @@ class AuthSessionResponse(BaseModel):
     user_auth_enabled: bool = Field(
         ..., description="Whether any user account exists, i.e. whether login is required"
     )
-    authenticated: bool = Field(..., description="Whether this request carries a valid session")
+    authenticated: bool = Field(
+        ..., description="Whether this request may access protected API routes"
+    )
     username: str | None = Field(None, description="The logged-in user, when authenticated")

@@ -45,7 +45,7 @@ async def test_state_a_nothing_configured_stays_open(client):
     session = await client.get("/api/v1/auth/session")
     assert session.json() == {
         "user_auth_enabled": False,
-        "authenticated": False,
+        "authenticated": True,
         "username": None,
     }
 
@@ -61,6 +61,19 @@ async def test_state_b_api_key_alone_behaves_exactly_as_before(client, monkeypat
     right = await client.get("/api/v1/profiles", headers={"X-API-Key": "top-secret"})
     assert right.status_code == 200
 
+    missing_session = await client.get("/api/v1/auth/session")
+    assert missing_session.json()["authenticated"] is False
+    wrong_session = await client.get("/api/v1/auth/session", headers={"X-API-Key": "nope"})
+    assert wrong_session.json()["authenticated"] is False
+    valid_session = await client.get(
+        "/api/v1/auth/session", headers={"X-API-Key": "top-secret"}
+    )
+    assert valid_session.json() == {
+        "user_auth_enabled": False,
+        "authenticated": True,
+        "username": None,
+    }
+
 
 @pytest.mark.asyncio
 async def test_state_c_a_user_existing_closes_the_api(client):
@@ -74,6 +87,22 @@ async def test_state_c_a_user_existing_closes_the_api(client):
     assert session.status_code == 200
     assert session.json()["user_auth_enabled"] is True
     assert session.json()["authenticated"] is False
+
+
+@pytest.mark.asyncio
+async def test_api_key_authenticates_session_probe_with_users(client, monkeypatch):
+    await _create_user()
+    monkeypatch.setenv("CPM_API_KEY", "top-secret")
+    get_settings.cache_clear()
+
+    session = await client.get(
+        "/api/v1/auth/session", headers={"X-API-Key": "top-secret"}
+    )
+    assert session.json() == {
+        "user_auth_enabled": True,
+        "authenticated": True,
+        "username": None,
+    }
 
 
 @pytest.mark.asyncio

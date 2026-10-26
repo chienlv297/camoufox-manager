@@ -10,7 +10,7 @@ from typing import NoReturn
 from fastapi import APIRouter, HTTPException, Request, Response
 from loguru import logger
 
-from camoufox_pm.api.dependencies import get_storage_manager
+from camoufox_pm.api.dependencies import _api_key_matches, get_storage_manager
 from camoufox_pm.api.models.auth import AuthSessionResponse, LoginRequest
 from camoufox_pm.api.models.system import ApiResponse
 from camoufox_pm.config import get_settings
@@ -106,15 +106,17 @@ async def logout(request: Request, response: Response) -> ApiResponse[None]:
     ),
 )
 async def get_auth_session(request: Request) -> AuthSessionResponse:
-    """Report whether login is required and whether the caller is logged in."""
+    """Report whether login is required and whether the caller may use the API."""
     storage = get_storage_manager()
     user_auth_enabled = await storage.count_users() > 0
     username = None
     token = request.cookies.get(auth.SESSION_COOKIE)
     if token:
         username = await auth.validate_session(storage, token)
+    api_key_authenticated = _api_key_matches(request.headers.get("X-API-Key"))
+    local_access = not user_auth_enabled and not get_settings().api_key
     return AuthSessionResponse(
         user_auth_enabled=user_auth_enabled,
-        authenticated=username is not None,
+        authenticated=username is not None or api_key_authenticated or local_access,
         username=username,
     )
