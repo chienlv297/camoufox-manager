@@ -348,6 +348,11 @@ export interface BulkTagsResult {
   skipped: { id: string; reason: string }[]
 }
 
+export interface BulkLaunchResult {
+  launched: { profile_id: string; status: string }[]
+  failed: { profile_id: string; message: string }[]
+}
+
 export const profilesAPI = {
   async bulkTags(profiles: Profile[], add: string[], remove: string[]): Promise<BulkTagsResult> {
     const body = await request<{ data: BulkTagsResult }>(`${API_PREFIX}/profiles/tags`, { method: 'POST', body: JSON.stringify({ profiles: profiles.map(({ id, row_version }) => ({ id, row_version })), add, remove }) })
@@ -385,6 +390,14 @@ export const profilesAPI = {
       method: 'POST',
       body: JSON.stringify({ headless: false }),
     })
+  },
+
+  async startProfiles(ids: string[]): Promise<BulkLaunchResult> {
+    const body = await request<{ data: BulkLaunchResult }>(`${API_PREFIX}/profiles/bulk-launch`, {
+      method: 'POST',
+      body: JSON.stringify({ profile_ids: ids }),
+    })
+    return body.data
   },
 
   closeProfile(id: string): Promise<unknown> {

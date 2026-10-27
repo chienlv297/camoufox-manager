@@ -66,6 +66,7 @@ class StageTwoUI(DesktopUI):
             ],
         }
         self.templates = []
+        self.bulk_launch_fail = set()
         self.multipart_content_type = None
         self.browser_state = {
             "installed": True,
@@ -161,6 +162,21 @@ class StageTwoUI(DesktopUI):
             body = request.post_data_json
             data, envelope = profile(99, **body), False
             self.profiles.append(data)
+        elif path == "/profiles/bulk-launch" and request.method == "POST":
+            ids = request.post_data_json["profile_ids"]
+            self.running_profile_ids.extend(
+                profile_id for profile_id in ids if profile_id not in self.bulk_launch_fail
+            )
+            data = {
+                "launched": [
+                    {"profile_id": profile_id, "status": "launched"}
+                    for profile_id in ids if profile_id not in self.bulk_launch_fail
+                ],
+                "failed": [
+                    {"profile_id": profile_id, "message": "Could not start"}
+                    for profile_id in ids if profile_id in self.bulk_launch_fail
+                ],
+            }
         elif (
             path.startswith("/profiles/")
             and request.method == "PUT"
@@ -260,6 +276,29 @@ class StageTwoUI(DesktopUI):
 
     def open_actions(self, name):
         self.page.get_by_role("button", name=f"Actions for {name}", exact=True).click()
+
+    def test_stage_two_selected_profiles_launch_with_one_action(self):
+        self.open_profiles()
+        self.page.get_by_role("checkbox", name="Select Account 001", exact=True).check()
+        self.page.get_by_role("checkbox", name="Select Account 002", exact=True).check()
+        self.page.get_by_role("button", name="Run selected (2)", exact=True).click()
+        expect(self.page.get_by_text("Launched 2 browsers", exact=True)).to_be_visible()
+        calls = [
+            json.loads(body)
+            for method, path, body in self.calls
+            if method == "POST" and path == "/profiles/bulk-launch"
+        ]
+        self.assertEqual(calls, [{"profile_ids": ["profile-1", "profile-2"]}])
+
+    def test_stage_two_selected_profiles_show_partial_launch_failure(self):
+        self.bulk_launch_fail.add("profile-2")
+        self.open_profiles()
+        self.page.get_by_role("checkbox", name="Select Account 001", exact=True).check()
+        self.page.get_by_role("checkbox", name="Select Account 002", exact=True).check()
+        self.page.get_by_role("button", name="Run selected (2)", exact=True).click()
+        expect(self.page.get_by_text("Launched 1 of 2 browsers", exact=True)).to_be_visible()
+        expect(self.page.get_by_text("Account 002: Could not start", exact=True)).to_be_visible()
+        self.assertEqual(self.running_profile_ids, ["profile-1"])
 
     def test_stage_two_tag_chip_and_bulk_exact_versions_partial_result(self):
         self.tag_skips = [

@@ -314,6 +314,26 @@ class ProfileLaunchResponse(BaseModel):
     )
 
 
+class BulkProfileLaunchRequest(BaseModel):
+    """Request body for launching multiple profiles together."""
+
+    profile_ids: list[str] = Field(..., min_length=1, max_length=100)
+
+
+class BulkProfileLaunchFailure(BaseModel):
+    """One profile that could not be launched by a bulk request."""
+
+    profile_id: str
+    message: str
+
+
+class BulkProfileLaunchResponse(BaseModel):
+    """Partial-success result for a concurrent profile launch."""
+
+    launched: list[ProfileLaunchResponse]
+    failed: list[BulkProfileLaunchFailure]
+
+
 class BrowserCloseResponse(BaseModel):
     """Response returned when a browser is asked to close."""
 

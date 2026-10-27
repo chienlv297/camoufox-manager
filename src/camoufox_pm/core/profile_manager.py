@@ -985,14 +985,9 @@ class ProfileManager:
                 pinned = fingerprint_store.normalize_screen_origin(pinned)
                 profile.fingerprint = pinned
             if not pinned:
-                # resolve() can do network I/O (it fetches the uBlock addon on a
-                # fresh install). It used to have to stay synchronous, because
-                # the whole Profile was written back afterwards and an await here
-                # would let a concurrent rename be reverted. The write below now
-                # names only the columns a launch owns, so there is nothing left
-                # for an await to clobber; moving this off the event loop is a
-                # separate change, and this comment is the note that it is safe.
-                pinned = fingerprint_store.resolve(options)
+                # Resolution can read large browser resources. Keep it off the
+                # event loop so concurrent launches can prepare together.
+                pinned = await run_file_operation(fingerprint_store.resolve, options)
                 if pinned:
                     profile.fingerprint = pinned
             if pinned:

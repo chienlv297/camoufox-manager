@@ -219,6 +219,15 @@ async def test_nonadmin_server_errors_and_password_validation_do_not_echo_secret
     response = await client.post(f"/api/v1/profiles/{profile.id}/launch", json={})
     assert response.status_code == 500
     assert "proxy-secret" not in response.text and "/private/browser" not in response.text
+    response = await client.post(
+        "/api/v1/profiles/bulk-launch", json={"profile_ids": [profile.id, "missing"]}
+    )
+    assert response.status_code == 200
+    assert response.json()["data"]["failed"] == [
+        {"profile_id": profile.id, "message": "Profile operation failed"},
+        {"profile_id": "missing", "message": "Profile operation failed"},
+    ]
+    assert "proxy-secret" not in response.text and "/private/browser" not in response.text
     events = await manager.storage.list_audit(action="launch_profile")
     assert events[0]["result"] == "failure"
     assert "proxy-secret" not in str(events)

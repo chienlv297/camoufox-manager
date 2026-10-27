@@ -418,6 +418,7 @@ encryption key as part of an offline installation backup.
 
 ```http
 POST /api/v1/profiles/{id}/launch    {"headless": false, "window_size": "1280x720", "initial_urls": ["https://example.com/"]}
+POST /api/v1/profiles/bulk-launch    {"profile_ids": ["profile-a", "profile-b"]}
 POST /api/v1/profiles/{id}/close
 GET  /api/v1/browsers/active
 POST /api/v1/browsers/close-all
@@ -426,6 +427,10 @@ POST /api/v1/browsers/close-all
 Launch responds with `status` (`launched`, or `already_running` if the profile's
 browser is already up), a `message` and the `process_id`. Closing a browser that
 is not running is a no-op reported as `status: "not_running"`, not an error.
+
+Bulk launch accepts up to 100 profile IDs per request, ignores duplicates, and
+starts up to three browsers concurrently. The response separates `launched`
+and `failed` results, so one bad profile does not block the others.
 
 `initial_urls` is optional. After the context is launched, each URL is navigated
 in order into an existing page (or a new page when needed), so callers do not

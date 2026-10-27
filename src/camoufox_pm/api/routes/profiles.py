@@ -2,6 +2,7 @@
 API routes for managing profiles.
 """
 
+import asyncio
 import re
 import shutil
 import tempfile
@@ -31,6 +32,9 @@ from camoufox_pm.api.models.profiles import (
     ActiveBrowsersResponse,
     BrowserCloseResponse,
     BrowsersCloseAllResponse,
+    BulkProfileLaunchFailure,
+    BulkProfileLaunchRequest,
+    BulkProfileLaunchResponse,
     BulkTagsRequest,
     BulkTagsResponse,
     ClearGeographyRequest,
@@ -55,6 +59,7 @@ from camoufox_pm.core.leases import ProfileLocked
 from camoufox_pm.core.models import BrowserSettings, ProfileStatus, ProxyConfig
 
 router = APIRouter()
+_BULK_LAUNCH_CONCURRENCY = 3
 
 # Maps the deprecated flattened update fields onto their browser_settings keys.
 _FLATTENED_BROWSER_FIELDS = {
@@ -404,37 +409,7 @@ async def launch_profile(profile_id: str, request: ProfileLaunchRequest):
     """Launch a browser with a profile."""
     await require_profile_access(profile_id, "launch")
     try:
-        profile_manager = get_profile_manager()
-        additional_options = dict(request.additional_options or {}) if is_admin() else {}
-        legacy_initial_urls = additional_options.pop("initial_urls", None)
-        initial_urls = request.initial_urls or legacy_initial_urls or []
-
-        # Launch the browser
-        browser_session = await profile_manager.launch_browser(
-            profile_id,
-            headless=request.headless,
-            window_size=request.window_size,
-            initial_urls=initial_urls,
-            **additional_options,
-        )
-
-        logger.info(f"Launched browser for profile: {profile_id}")
-
-        return ProfileLaunchResponse(
-            profile_id=profile_id,
-            browser_session_id=str(uuid.uuid4()),
-            status=browser_session.get("status", "launched") if is_admin() else "launched",
-            message=browser_session.get("message", "Browser launched successfully")
-            if is_admin()
-            else "Browser launched successfully",
-            process_id=browser_session.get("process_id"),
-            camoufox_options={
-                "process_id": browser_session.get("process_id"),
-                "status": browser_session.get("status") if is_admin() else "launched",
-                "options": browser_session.get("camoufox_options", {}) if is_admin() else {},
-            },
-        )
-
+        return await _launch_profile(profile_id, request)
     except ProfileLocked as e:
         # Another instance holds the lease. A conflict, not a fault: the client
         # can retry once the holder closes the browser, and a 500 would read as
@@ -452,6 +427,74 @@ async def launch_profile(profile_id: str, request: ProfileLaunchRequest):
         raise HTTPException(
             status_code=500, detail=str(e) if is_admin() else "Profile operation failed"
         ) from e
+
+
+async def _launch_profile(
+    profile_id: str, request: ProfileLaunchRequest
+) -> ProfileLaunchResponse:
+    profile_manager = get_profile_manager()
+    additional_options = dict(request.additional_options or {}) if is_admin() else {}
+    legacy_initial_urls = additional_options.pop("initial_urls", None)
+    initial_urls = request.initial_urls or legacy_initial_urls or []
+    browser_session = await profile_manager.launch_browser(
+        profile_id,
+        headless=request.headless,
+        window_size=request.window_size,
+        initial_urls=initial_urls,
+        **additional_options,
+    )
+    logger.info(f"Launched browser for profile: {profile_id}")
+    return ProfileLaunchResponse(
+        profile_id=profile_id,
+        browser_session_id=str(uuid.uuid4()),
+        status=browser_session.get("status", "launched") if is_admin() else "launched",
+        message=browser_session.get("message", "Browser launched successfully")
+        if is_admin()
+        else "Browser launched successfully",
+        process_id=browser_session.get("process_id"),
+        camoufox_options={
+            "process_id": browser_session.get("process_id"),
+            "status": browser_session.get("status") if is_admin() else "launched",
+            "options": browser_session.get("camoufox_options", {}) if is_admin() else {},
+        },
+    )
+
+
+@router.post(
+    "/profiles/bulk-launch",
+    response_model=ApiResponse[BulkProfileLaunchResponse],
+    operation_id="bulk_launch_profiles",
+    summary="Launch multiple browsers concurrently.",
+)
+async def bulk_launch_profiles(request: BulkProfileLaunchRequest):
+    profile_ids = list(dict.fromkeys(request.profile_ids))
+    launch_request = ProfileLaunchRequest(headless=False)
+    semaphore = asyncio.Semaphore(_BULK_LAUNCH_CONCURRENCY)
+
+    async def launch_one(profile_id: str):
+        async with semaphore:
+            try:
+                await require_profile_access(profile_id, "launch")
+                return await _launch_profile(profile_id, launch_request)
+            except HTTPException as exc:
+                message = str(exc.detail) if is_admin() else "Profile operation failed"
+            except ProfileLocked as exc:
+                message = str(exc) if is_admin() else "Profile operation failed"
+            except ValueError as exc:
+                message = str(exc) if is_admin() else "Profile operation failed"
+            except Exception as exc:  # noqa: BLE001 - partial failure is the endpoint contract
+                logger.error(f"Failed to launch browser for profile {profile_id}: {exc}")
+                message = str(exc) if is_admin() else "Profile operation failed"
+        return BulkProfileLaunchFailure(profile_id=profile_id, message=message)
+
+    results = await asyncio.gather(*(launch_one(profile_id) for profile_id in profile_ids))
+    launched = [result for result in results if isinstance(result, ProfileLaunchResponse)]
+    failed = [result for result in results if isinstance(result, BulkProfileLaunchFailure)]
+    return ApiResponse(
+        success=not failed,
+        message="Browser launch completed",
+        data=BulkProfileLaunchResponse(launched=launched, failed=failed),
+    )
 
 
 @router.post(

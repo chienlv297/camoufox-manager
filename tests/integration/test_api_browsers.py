@@ -4,6 +4,8 @@ No browser is started: a stand-in session is registered so the endpoints that
 report and close them can be checked without a Camoufox binary.
 """
 
+import asyncio
+
 import pytest
 
 from camoufox_pm.api.dependencies import get_profile_manager
@@ -126,6 +128,44 @@ async def test_launch_accepts_initial_urls_in_additional_options(
     assert captured["initial_urls"] == expected_urls
     if "humanize" in payload.get("additional_options", {}):
         assert captured["humanize"] is True
+
+
+@pytest.mark.asyncio
+async def test_bulk_launch_starts_profiles_concurrently_and_reports_partial_failure(
+    client, monkeypatch
+):
+    manager = get_profile_manager()
+    first = (await client.post("/api/profiles", json={"name": "first"})).json()
+    second = (await client.post("/api/profiles", json={"name": "second"})).json()
+    active = 0
+    peak = 0
+
+    async def fake_launch(profile_id, **kwargs):
+        nonlocal active, peak
+        if profile_id == "missing":
+            raise ValueError("Profile with ID missing not found")
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return {"status": "launched", "profile_id": profile_id}
+
+    monkeypatch.setattr(manager, "launch_browser", fake_launch)
+
+    response = await client.post(
+        "/api/profiles/bulk-launch",
+        json={"profile_ids": [first["id"], second["id"], "missing"]},
+    )
+
+    assert response.status_code == 200
+    assert peak == 2
+    assert [item["profile_id"] for item in response.json()["data"]["launched"]] == [
+        first["id"],
+        second["id"],
+    ]
+    assert response.json()["data"]["failed"] == [
+        {"profile_id": "missing", "message": "Profile with ID missing not found"}
+    ]
 
 
 @pytest.mark.asyncio

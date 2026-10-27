@@ -91,6 +91,7 @@ export default function ProfilesPage() {
 
   const [checkingProxies, setCheckingProxies] = useState<Set<string>>(new Set())
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [launchingSelected, setLaunchingSelected] = useState(false)
   const [menuFor, setMenuFor] = useState<string | null>(null)
   const [formOpen, setFormOpen] = useState(false)
   const [editing, setEditing] = useState<Profile | null>(null)
@@ -261,6 +262,15 @@ export default function ProfilesPage() {
     () => profiles.filter((profile) => selected.has(profile.id) && profile.proxy_config).length,
     [profiles, selected],
   )
+  const selectedLaunchable = useMemo(
+    () => profiles.filter((profile) => {
+      if (!selected.has(profile.id) || running.has(profile.id)) return false
+      if (!(canManageAccess || profile.permissions?.launch === true)) return false
+      const binding = syncBindings.find((item) => item.local_id === profile.id)
+      return !binding || (binding.phase === 'held' && binding.lifecycle?.state !== 'trashed' && binding.local_trashed !== true)
+    }),
+    [canManageAccess, profiles, running, selected, syncBindings],
+  )
 
   const totalPages = Math.max(1, Math.ceil(visible.length / perPage))
   // Deleting the last rows of a page must not strand the user on an empty one.
@@ -326,6 +336,42 @@ export default function ProfilesPage() {
         toast('error', t('Could not close browser'), String(err))
       }
     })
+  }
+
+  async function launchSelected() {
+    if (!selectedLaunchable.length || launchingSelected) return
+    const launchIds = selectedLaunchable.map((profile) => profile.id)
+    setLaunchingSelected(true)
+    setBusy((current) => new Set([...current, ...launchIds]))
+    try {
+      const launched: { profile_id: string; status: string }[] = []
+      const failed: { profile_id: string; message: string }[] = []
+      for (let offset = 0; offset < launchIds.length; offset += 100) {
+        const result = await profilesAPI.startProfiles(launchIds.slice(offset, offset + 100))
+        launched.push(...result.launched)
+        failed.push(...result.failed)
+      }
+      if (failed.length) {
+        const names = new Map(profiles.map((profile) => [profile.id, profile.name]))
+        toast(
+          'error',
+          t('Launched {count} of {total} browsers', { count: launched.length, total: launchIds.length }),
+          failed.slice(0, 5).map((failure) => `${names.get(failure.profile_id) ?? failure.profile_id}: ${failure.message}`).join('\n'),
+        )
+      } else {
+        toast('ok', launchIds.length === 1 ? t('Launched 1 browser') : t('Launched {count} browsers', { count: launchIds.length }))
+      }
+    } catch (err) {
+      toast('error', t('Could not launch selected browsers'), String(err))
+    } finally {
+      await Promise.all([loadRunning(), loadProfiles()])
+      setBusy((current) => {
+        const next = new Set(current)
+        launchIds.forEach((id) => next.delete(id))
+        return next
+      })
+      setLaunchingSelected(false)
+    }
   }
 
   function download(blob: Blob, filename: string) {
@@ -678,6 +724,14 @@ export default function ProfilesPage() {
       {selected.size > 0 && (
         <div className="flex items-center gap-3 border-b border-line bg-raised px-5 py-2">
           <span>{t('{count} selected', { count: selected.size })}</span>
+          {selectedLaunchable.length > 0 && (
+            <button className="btn btn-primary h-7" disabled={launchingSelected || selectedLaunchable.some((profile) => busy.has(profile.id))} onClick={launchSelected}>
+              <Play size={11} fill="currentColor" />
+              {launchingSelected
+                ? t('Launching selected…')
+                : t('Run selected ({count})', { count: selectedLaunchable.length })}
+            </button>
+          )}
           <button className="btn btn-default h-7" onClick={() => setTagsFor(profiles.filter(profile => selected.has(profile.id)))}><Tags size={13} aria-hidden="true" />{t('Edit tags')}</button>
           {selectedWithProxy > 0 && (
             <button
